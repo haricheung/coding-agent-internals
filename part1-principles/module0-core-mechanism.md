@@ -80,9 +80,9 @@ Tool Call: Glob
   pattern: "**/*register*"
 
 Result:
-  app/views/auth.py
-  app/tests/test_auth.py
-  app/urls.py
+  app/views/register.py
+  app/tests/test_register.py
+  app/forms/register_form.py
 ```
 
 ```
@@ -91,8 +91,8 @@ Tool Call: Grep
   glob: "*.py"
 
 Result:
-  app/views/auth.py:45: def register_user(request):
-  app/tests/test_auth.py:23: def test_register_success(self):
+  app/views/register.py:45: def register_user(request):
+  app/views/register.py:78: def register_confirm(request):
 ```
 
 **阶段：Grounding（感知）**
@@ -103,13 +103,13 @@ Result:
 - 再用 `Grep` 做内容搜索（精确定位）
 - 这种"先粗后细"的搜索策略（coarse-to-fine search）是一个经典的信息获取模式
 
-**工程细节**：为什么不直接用 `Bash` 执行 `grep -r`？因为专用工具提供了结构化的输出，更容易被 LLM 解析，且对用户更透明（可审查性更好）。
+**工程细节**：为什么不直接用 `Bash` 执行 `grep -r`？专用的 Grep 工具底层同样是命令行工具（ripgrep），但关键区别在于**接口设计**：LLM 不需要自己拼命令字符串（容易出错——flag 写错、转义遗漏、路径错误），只需填写结构化参数（`pattern`、`glob`），框架负责处理执行细节。这是 ACI（Agent-Computer Interface）设计的核心思想——同样的底层能力，一层对 LLM 友好的接口就能显著降低出错率。
 
 #### 第四帧：阅读代码（Grounding — 深入感知）
 
 ```
 Tool Call: Read
-  file_path: "/app/backend/app/views/auth.py"
+  file_path: "/app/backend/app/views/register.py"
 
 Result:
    1  from django.http import JsonResponse
@@ -149,12 +149,12 @@ Result:
 
 ```
 Tool Call: Read
-  file_path: "/app/backend/app/tests/test_auth.py"
+  file_path: "/app/backend/app/tests/test_register.py"
 
 Result:
    1  from django.test import TestCase, Client
    2
-   3  class AuthTestCase(TestCase):
+   3  class RegisterTestCase(TestCase):
    4      def setUp(self):
    5          self.client = Client()
    6
@@ -178,7 +178,9 @@ Result:
 
 代理注意到现有测试也反映了这个 bug——`test_register_duplicate` 居然断言 500 状态码，说明这个问题可能长期存在且被"接受"了。
 
-**关键观察**：代理在修复代码之前先看了测试，这体现了一个重要的工程实践——理解现有测试覆盖情况，避免引入回归。
+**关键观察**：代理在修复代码之前先看了测试，这体现了一个重要的工程实践——理解现有测试覆盖情况，避免引入回归（regression，即软件质量的倒退：修了 A 却把 B 搞坏了，俗话说"按下葫芦浮起瓢"）。
+
+**但要警惕**：代理把测试当作"标准答案"来验证自己的修复。如果测试本身就是错的呢？上面的例子中 `test_register_duplicate` 断言了 500 状态码——这本身就是一个错误的测试（应该是 409）。如果代理不加判断地"让所有测试通过"，它会按照错误的预期去写代码。这揭示了 Feedback 环节的一个根本性风险：**当评价函数本身不可靠时，代理会"认真地做错事"**。好的代理应该能识别出"测试本身有 bug"这种情况——这也是为什么 Feedback 策略不能只依赖测试，还需要模型自评和人工审查作为补充。
 
 #### 第六帧：制定修复方案（Planning）
 
@@ -202,7 +204,7 @@ Assistant (thinking):
 
 ```
 Tool Call: Edit
-  file_path: "/app/backend/app/views/auth.py"
+  file_path: "/app/backend/app/views/register.py"
   old_string: "from django.http import JsonResponse
 from django.views.decorators.http import require_POST
 from django.contrib.auth.models import User
@@ -225,7 +227,7 @@ def validate_username(username):
 
 ```
 Tool Call: Edit
-  file_path: "/app/backend/app/views/auth.py"
+  file_path: "/app/backend/app/views/register.py"
   old_string: "@require_POST
 def register_user(request):
     try:
@@ -282,14 +284,14 @@ def register_user(request):
 
 ```
 Tool Call: Edit
-  file_path: "/app/backend/app/tests/test_auth.py"
-  old_string: "class AuthTestCase(TestCase):
+  file_path: "/app/backend/app/tests/test_register.py"
+  old_string: "class RegisterTestCase(TestCase):
     def setUp(self):
         self.client = Client()
 
     def test_register_success(self):
         ..."
-  new_string: "class AuthTestCase(TestCase):
+  new_string: "class RegisterTestCase(TestCase):
     def setUp(self):
         self.client = Client()
 
@@ -345,15 +347,15 @@ Tool Call: Edit
 
 ```
 Tool Call: Bash
-  command: "cd /app/backend && python -m pytest app/tests/test_auth.py -v"
+  command: "cd /app/backend && python -m pytest app/tests/test_register.py -v"
 
 Result:
-  app/tests/test_auth.py::AuthTestCase::test_register_success PASSED
-  app/tests/test_auth.py::AuthTestCase::test_register_special_chars_rejected PASSED
-  app/tests/test_auth.py::AuthTestCase::test_register_short_username_rejected PASSED
-  app/tests/test_auth.py::AuthTestCase::test_register_short_password_rejected PASSED
-  app/tests/test_auth.py::AuthTestCase::test_register_duplicate PASSED
-  app/tests/test_auth.py::AuthTestCase::test_register_invalid_json PASSED
+  app/tests/test_register.py::RegisterTestCase::test_register_success PASSED
+  app/tests/test_register.py::RegisterTestCase::test_register_special_chars_rejected PASSED
+  app/tests/test_register.py::RegisterTestCase::test_register_short_username_rejected PASSED
+  app/tests/test_register.py::RegisterTestCase::test_register_short_password_rejected PASSED
+  app/tests/test_register.py::RegisterTestCase::test_register_duplicate PASSED
+  app/tests/test_register.py::RegisterTestCase::test_register_invalid_json PASSED
 
   6 passed in 0.42s
 ```
@@ -1005,12 +1007,12 @@ ReAct 为 LLM 的输出定义了三种类型的"步骤"：
 ```
 Thought: 我需要找到注册接口的代码，先搜索包含 "register" 的文件
 Action: Search["register function python"]
-Observation: Found in app/views/auth.py, line 45: def register_user(request)
+Observation: Found in app/views/register.py, line 45: def register_user(request)
 Thought: 找到了注册函数，需要阅读它来理解当前的验证逻辑
-Action: Read["app/views/auth.py"]
+Action: Read["app/views/register.py"]
 Observation: [文件内容]
 Thought: 发现没有输入验证，特殊字符直接传给 create_user 导致异常
-Action: Edit["app/views/auth.py", ...]
+Action: Edit["app/views/register.py", ...]
 ```
 
 注意每个 `Thought` 都起到了承上启下的作用：
