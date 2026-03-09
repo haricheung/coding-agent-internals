@@ -2,7 +2,7 @@
 # Convert all course markdown files to PDF
 # Usage: ./convert-to-pdf.sh
 
-WEASYPRINT="/opt/homebrew/opt/python@3.9/Frameworks/Python.framework/Versions/3.9/bin/weasyprint"
+WEASYPRINT="/opt/homebrew/bin/weasyprint"
 CSS="pdf/style.css"
 OUTDIR="pdf"
 
