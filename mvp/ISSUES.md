@@ -70,3 +70,9 @@ Response: {"tool": "Read", "parameters": {"file_path": "..."}}
 1. Added rule: "When a file path is unclear, use Bash(`find . -name 'filename'`) to locate it. NEVER guess paths."
 2. Added rule: "For Read/Write tools, always use ABSOLUTE paths."
 3. Changed the example to show the find-then-read pattern.
+4. Inject a file tree snapshot into the system prompt at startup so the model always knows what files exist and where they are.
+
+## Issue 11: Client only executes one round of tool calls
+**Symptom:** Model does `find` → gets result → generates Read tool call → but Read never executes. The client stops after one tool round.
+**Root Cause:** `run()` had a fixed two-step flow: generate → execute tools → generate final response → done. If the second generation also contained tool calls, they were ignored.
+**Fix:** Changed `run()` to loop (up to 5 rounds): generate → if tool calls, execute and loop; if no tool calls, done. This supports multi-step workflows like find → read → analyze.

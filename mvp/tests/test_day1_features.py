@@ -153,6 +153,7 @@ def test_system_prompt():
         self.conversation = []
         self.working_dir = "/tmp/test_project"
         self.server_url = "http://fake"
+        self._file_tree = "(empty)"
     Client.__init__ = fake_init
 
     c = Client.__new__(Client)
@@ -164,8 +165,9 @@ def test_system_prompt():
     check("Prompt mentions Write tool", "Write" in prompt)
     check("Prompt mentions Bash tool", "Bash" in prompt)
     check("Prompt has tool_call format", "<tool_call>" in prompt)
-    check("Prompt says never ask to paste", "NEVER" in prompt and "paste" in prompt.lower() or "NEVER" in prompt)
-    check("Prompt instructs proactive tool use", "proactive" in prompt.lower() or "ALWAYS use tools" in prompt)
+    check("Prompt says never ask to paste", "NEVER" in prompt)
+    check("Prompt includes file tree", "(empty)" in prompt or "Files in this project" in prompt)
+    check("Prompt has example", "Example" in prompt)
 
     Client.__init__ = original_init
 

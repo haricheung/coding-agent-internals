@@ -21,6 +21,9 @@ class Client:
         self.conversation: List[Dict[str, str]] = []
         self.working_dir = working_dir or os.getcwd()
 
+        # Snapshot the file tree so the model knows what's available
+        self._file_tree = self._scan_files()
+
         # Check server is up
         try:
             resp = requests.get(f"{self.server_url}/health", timeout=3)
@@ -31,6 +34,21 @@ class Client:
                 f"Cannot connect to model server at {self.server_url}\n"
                 f"Start it first: python model_server.py <model_path>"
             )
+
+    def _scan_files(self) -> str:
+        """Scan working directory and return a file tree string"""
+        lines = []
+        for root, dirs, files in os.walk(self.working_dir):
+            # Skip hidden dirs and __pycache__
+            dirs[:] = [d for d in dirs if not d.startswith('.') and d != '__pycache__']
+            depth = root.replace(self.working_dir, '').count(os.sep)
+            indent = '  ' * depth
+            basename = os.path.basename(root) or '.'
+            lines.append(f"{indent}{basename}/")
+            for f in sorted(files):
+                if not f.startswith('.'):
+                    lines.append(f"{indent}  {f}")
+        return '\n'.join(lines[:50])  # Cap at 50 lines
 
     def get_system_prompt(self) -> str:
         """Generate the system prompt that teaches tool usage"""
@@ -44,32 +62,27 @@ class Client:
 
 Working directory: {self.working_dir}
 
+Files in this project:
+{self._file_tree}
+
 You have access to these tools:
 {chr(10).join(tools_desc)}
 
 IMPORTANT RULES:
-1. When the user asks about code, files, or bugs, ALWAYS use tools first. Use Bash to list files, Read to examine them, Write to create/modify them.
+1. ALWAYS use tools to act. Use Read to examine files, Write to create/modify them, Bash to run commands.
 2. NEVER ask the user to paste code or upload files. You can access the filesystem directly.
-3. Be proactive: if the user says "analyze the code" or "find the bug", use Bash("ls") or Bash("find . -name '*.py'") to discover files, then Read them.
-4. Keep your text responses short and focused on what you found.
-5. When a file path is unclear, use Bash("find . -name 'filename'") to locate it. NEVER guess paths.
-6. Bash commands run in the working directory. Use relative paths or Bash("pwd") if unsure.
-7. For Read/Write tools, always use ABSOLUTE paths. Combine the working directory with the relative path.
+3. Use the file tree above to locate files. Construct absolute paths as: {self.working_dir}/<relative_path>.
+4. If the user gives a partial filename like "buggy_code", match it to the closest file in the tree (e.g. buggy_code.py in tests/).
+5. Keep your text responses short and focused on what you found.
 
 To call a tool, use EXACTLY this format:
 <tool_call>
 {{"tool": "ToolName", "parameters": {{"param1": "value1"}}}}
 </tool_call>
 
-Example interaction:
-User: read buggy_code.py
-Assistant: Let me find that file first.
-<tool_call>
-{{"tool": "Bash", "parameters": {{"command": "find . -name 'buggy_code.py'"}}}}
-</tool_call>
-
-[After tool result shows: ./tests/buggy_code.py]
-Assistant: Found it. Let me read it.
+Example:
+User: read buggy_code
+Assistant: I see `tests/buggy_code.py` in the project. Let me read it.
 <tool_call>
 {{"tool": "Read", "parameters": {{"file_path": "{self.working_dir}/tests/buggy_code.py"}}}}
 </tool_call>
@@ -79,32 +92,32 @@ Assistant: Found it. Let me read it.
         """Process user input and return assistant response"""
         self.conversation.append({"role": "user", "content": user_input})
 
-        messages = [{"role": "system", "content": self.get_system_prompt()}]
-        messages.extend(self.conversation)
+        max_rounds = 5  # Prevent infinite loops
+        for _ in range(max_rounds):
+            messages = [{"role": "system", "content": self.get_system_prompt()}]
+            messages.extend(self.conversation)
 
-        print("\n🤖 ", end="", flush=True)
-        response = self._generate(messages)
+            print("\n🤖 ", end="", flush=True)
+            response = self._generate(messages)
 
-        text, tool_calls = extract_text_and_tool_calls(response)
+            text, tool_calls = extract_text_and_tool_calls(response)
 
-        if tool_calls:
+            if not tool_calls:
+                # No tool calls — final response, done
+                self.conversation.append({"role": "assistant", "content": response})
+                return None
+
+            # Execute tool calls
             tool_results = []
             for tc in tool_calls:
                 print(f"\n  🔧 Executing {tc.tool_name}...", flush=True)
                 result = self._execute_tool(tc)
                 tool_results.append(f"Tool: {tc.tool_name}\nResult: {result}")
 
+            # Add to conversation and loop for next round
             self.conversation.append({"role": "assistant", "content": response})
             tool_results_text = "\n\n".join(tool_results)
             self.conversation.append({"role": "user", "content": f"Tool results:\n{tool_results_text}"})
-
-            messages = [{"role": "system", "content": self.get_system_prompt()}]
-            messages.extend(self.conversation)
-            print("\n🤖 ", end="", flush=True)
-            final_response = self._generate(messages)
-            self.conversation.append({"role": "assistant", "content": final_response})
-        else:
-            self.conversation.append({"role": "assistant", "content": response})
 
         return None
 
