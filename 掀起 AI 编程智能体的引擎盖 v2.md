@@ -1,5 +1,7 @@
-# 掀起 AI 编程智能体的引擎盖 v3.0
+# 掀起 AI 编程智能体的引擎盖 v3.3
 
+> **v3.3 变更说明：** 重写 5.2 节为完整 MVP 架构说明（含 9 个工具、71 项测试），新增 5.2a 协议适配层架构决策（Claude tool_use ↔ Qwen 原生格式双向转换、格式对比表、设计收益分析）。
+>
 > **v3.0 变更说明：** 新增实践演练方案（第五章），包含 Demo 模型选型分析、各模块 Demo 策略设计、MVP 代码库集成方案。基于 v2.x 全部内容。
 >
 > **v2.0 变更说明：** 基于 Claude Code (Opus 4.6) 对 v1.0 的技术审校，修正了若干与 Claude Code 实际实现不符的描述，重写了模块三（Agent Team），新增了安全与权限控制章节。原始 v1.0 由 Gemini 协助生成。
@@ -497,29 +499,79 @@ token  "Read"  →  激活 Expert 4, 6
 
 **理由三：教学叙事更顺。** 用 7B 演示模块一二，观众看到 ReAct 循环确实能放大中等能力模型的表现（呼应 Boyd 的"基础能力是门槛，循环机制是放大器"）；到模块三 Agent Team 时，7B 的力不从心自然引出"为什么工业级系统需要 Opus/Sonnet 级别模型做 orchestrator"——形成从能力边界到工程选型的认知闭环。
 
-## 5.2 MVP 代码库：现有基础
+## 5.2 MVP 代码库：架构与协议适配
 
-课程 demo 基于 `mvp/` 目录下的 Day 1 实现，架构如下：
+课程 demo 基于 `mvp/` 目录下的完整实现，架构如下：
 
 ```
 mvp/
 ├── src/
 │   ├── model_server.py   ← FastAPI 模型推理服务（加载 Qwen，SSE 流式输出）
-│   ├── client.py          ← Agent 核心循环（ReAct loop，最多 5 轮工具调用）
+│   ├── adapter.py         ← 协议适配层（Claude tool_use ↔ Qwen 原生格式双向转换）
+│   ├── client.py          ← Agent 核心循环（ReAct loop，最多 10 轮工具调用）
 │   ├── parser.py          ← 工具调用解析器（XML / 代码块 / 裸 JSON 三策略）
-│   ├── tools.py           ← 工具实现（Read / Write / Bash）
+│   ├── tools.py           ← 基础工具（Read / Write / Edit / Grep / Bash，5 个）
+│   ├── task_tools.py      ← 任务管理工具（TaskCreate / TaskUpdate / TaskList，3 个）
+│   ├── agent_tool.py      ← 子 Agent 生成工具（Agent，1 个）
 │   └── main.py            ← REPL 入口
 └── tests/
     ├── buggy_code.py      ← 预置 Bug：off-by-one IndexError
-    ├── test_day1_features.py  ← 完整测试套件（35+ 检查项）
+    ├── large_module.py    ← 442 行大文件（含 ZeroDivisionError bug，ACI 演示用）
+    ├── test_all.py        ← 完整测试套件（71 项，覆盖工具/解析/适配/任务/集成）
     └── ...
 ```
 
+### 5.2a 关键架构决策：协议适配层（Adapter Pattern）
+
+**问题：** 课程 MVP 用 Qwen2.5-Coder-7B 做推理后端，但客户端需要教学生"真实的 Claude Code 工作原理"。如果客户端直接说 Qwen 的原生格式（`<tool_call>` XML 标签 + OpenAI 函数调用风格），那代码和 Claude Code 的真实架构没有任何映射关系，观众学到的是"如何接 Qwen API"而非"Claude Code 是怎么工作的"。
+
+**决策：** 引入一个**协议适配层**（`adapter.py`），让客户端和 Claude Code 说相同的协议，让模型说自己训练时的原生格式，适配层负责双向翻译：
+
+```
+┌────────────────┐         ┌──────────────┐         ┌──────────────┐
+│  Client        │  Claude  │  Adapter     │  Qwen   │  Qwen Model  │
+│  (教学侧)      │  tool_use│  (adapter.py)│  native │  (推理侧)    │
+│                │  协议    │              │  格式   │              │
+│  content blocks│ ──────→ │  tools → fn  │ ──────→ │ <tool_call>  │
+│  tool_use      │         │  blocks→msgs │         │ </tool_call> │
+│  tool_result   │ ←────── │  text→blocks │ ←────── │ raw text     │
+│  stop_reason   │         │  +stop_reason│         │              │
+└────────────────┘         └──────────────┘         └──────────────┘
+```
+
+**这个适配层做的事情，本质上就是 Anthropic API 基础设施在做的事——把模型的原始文本输出结构化为 typed content blocks。** 区别在于 Anthropic 用前沿模型 + 约束解码做确定性保证，我们用 7B 模型 + 鲁棒解析做概率性兜底。
+
+**协议格式对比（核心教学素材）：**
+
+| 维度 | Claude tool_use 协议（客户端侧） | Qwen 原生格式（模型侧） |
+|---|---|---|
+| 工具定义 | `input_schema: {type: "object", ...}` | `type: "function", function: {parameters: ...}` |
+| 工具调用 | `{type: "tool_use", id: "toolu_xxx", name: "Read", input: {...}}` | `<tool_call>{"name":"Read","arguments":{...}}</tool_call>` |
+| 工具结果 | `{type: "tool_result", tool_use_id: "toolu_xxx", content: "..."}` | `<tool_response>...</tool_response>` |
+| ID 关联 | 用 `tool_use_id` 精确关联请求和结果 | 无 ID，靠位置顺序匹配 |
+| 停止信号 | `stop_reason: "tool_use"` \| `"end_turn"` | 文本层无显式信号，需解析推断 |
+| 消息结构 | `content: [block, block, ...]`（类型化列表） | `content: "string"`（纯文本） |
+
+**为什么不直接让客户端说 Qwen 格式（更简单的方案）：**
+
+1. **教学映射断裂：** 学生看到 `<tool_call>` 标签和 OpenAI 函数调用结构，会以为 Claude Code 也是这么工作的。实际上 Claude Code 的客户端处理的是 `tool_use` content blocks，而非 XML 标签解析。
+2. **协议设计差异是核心教学点：** Claude 的 `tool_use_id` 关联机制、content blocks 类型系统、`stop_reason` 信令——这些设计决策各有工程考量。如果客户端直接用 Qwen 格式，这些讨论无从展开。
+3. **适配层本身是教材：** `adapter.py` 的存在让学生直观看到"API 基础设施在幕后做了什么"——同一个工具调用，从模型文本输出到 API 返回的结构化对象，中间经历了解析、验证、类型化的完整过程。
+
+**三个设计收益：**
+
+1. **客户端代码与 Claude Code 真实架构 1:1 映射：** `client.py` 中的 `stop_reason == "tool_use"` 循环判断、content blocks 遍历、`tool_use_id` 关联构造——每一行都能在 Claude Code 的实际行为中找到对应物。
+2. **模型用原生格式推理，最大化工具调用可靠性：** Qwen 的 `<tool_call>` 格式是训练时见过的，用原生格式比强迫模型学习 Claude 格式可靠得多。
+3. **适配层的存在本身解释了"为什么前沿模型不需要这一层"：** Claude 的 tool calling 是原生能力 + API 层结构化保障，不需要文本层解析。MVP 需要这个适配层恰恰说明了 7B 模型与前沿模型在工具调用上的架构差异——这直接呼应 5.1 节"前沿模型如何跳过防御层"的讨论。
+
 已具备的 demo 能力：
+- **协议适配架构**：客户端说 Claude 协议，模型说原生格式，adapter 双向翻译
 - 客户端-服务器架构：模型加载一次，客户端即连即用
 - SSE 实时流式输出：token 逐个显示，直观展示生成过程
-- 多轮工具执行：agent 最多链式执行 5 轮 Read → Write → Bash
+- 多轮工具执行：agent 最多链式执行 10 轮（Read/Edit/Grep/Bash + Task 管理 + Agent 生成）
 - 鲁棒解析器：处理小模型常见的格式畸变（三引号、尾逗号、残缺标签）
+- 任务管理系统：TaskCreate/Update/List 实现看板式协调
+- Agent Team 模式：主 Agent 拆解任务，spawn 子 Agent 并行执行
 - 主动探索行为：system prompt 指示模型自主发现文件，而非要求用户粘贴代码
 
 ## 5.3 各模块 Demo 策略
@@ -536,14 +588,15 @@ mvp/
 
 ### Demo 2：tool_use 协议拆解（模块一 · 10:00 工具调用）
 
-**目标：** 让观众看到工具调用不是黑魔法，而是可审计的 JSON 请求/响应。
+**目标：** 让观众看到工具调用不是黑魔法，而是可审计的 JSON 请求/响应。同时展示协议适配层如何在 Claude 格式和 Qwen 原生格式之间做双向翻译。
 
 **准备：**
 - 并排展示两段 curl 请求：一段普通 `chat completion`，一段带 `tools` 定义的请求
 - 使用 MVP 的 `model_server.py` 作为后端，手动构造带工具定义的请求，展示模型返回的 `<tool_call>` 结构
 - 展示 `parser.py` 的三种解析策略：XML 标签、代码块、裸 JSON —— 说明为什么小模型需要如此宽容的解析
+- **新增：** 展示 `adapter.py` 的双向转换过程——同一次工具调用在 Claude 协议和 Qwen 原生格式中的不同表达，对照 5.2a 的格式对比表
 
-**观众收获：** 工具调用 = 应用层 JSON 协议，不是 tokenizer 魔法。小模型的格式不稳定恰好解释了为什么 Claude Code 选择严格 schema。
+**观众收获：** 工具调用 = 应用层 JSON 协议，不是 tokenizer 魔法。小模型的格式不稳定恰好解释了为什么 Claude Code 选择严格 schema。适配层的存在说明了 API 基础设施在幕后做的"翻译"工作。
 
 ### Demo 3：修 Bug 全流程（模块一 · 10:50 修 Bug 实战）
 
@@ -604,12 +657,13 @@ mvp/
 |:---:|---|---|:---:|
 | 1 | 启动 `model_server.py`（Qwen2.5-Coder-7B），确认 GPU 就绪 | 全部 Live Demo | 全部 |
 | 2 | `tests/buggy_code.py`（off-by-one bug） | Bug 修复演示 | 一、二 |
-| 3 | 一个 200+ 行的 Python 文件 | ACI 信息粒度对比 | 二 |
+| 3 | `tests/large_module.py`（442 行，含 ZeroDivisionError） | ACI 信息粒度对比 | 二 |
 | 4 | 两段 curl 命令：普通 chat vs tool_use 请求 | 协议拆解 | 一 |
-| 5 | Chat 模式修 Bug 的预录视频/截图 | 开环 vs 闭环对比 | 一 |
-| 6 | Claude Code Agent Team 的预录视频 | Team 模式全流程 | 三 |
-| 7 | Agentless 三阶段流水线的 PPT/伪代码 | 架构对比 | 二 |
-| 8 | 二维认知地图打印版（L-R-V × OODA） | 全程导航 | 全部 |
+| 5 | `adapter.py` 协议格式对比表 + 双向转换 Demo | 协议适配层教学 | 一 |
+| 6 | Chat 模式修 Bug 的预录视频/截图 | 开环 vs 闭环对比 | 一 |
+| 7 | Claude Code Agent Team 的预录视频 | Team 模式全流程 | 三 |
+| 8 | Agentless 三阶段流水线的 PPT/伪代码 | 架构对比 | 二 |
+| 9 | 二维认知地图打印版（L-R-V × OODA） | 全程导航 | 全部 |
 
 ## 5.5 关键教学设计原则
 
@@ -632,6 +686,7 @@ mvp/
 
 ---
 
+*v3.3 | 2026-03-26 | 5.2 重写为完整 MVP 架构说明，新增协议适配层（Adapter Pattern）架构决策：Claude tool_use ↔ Qwen 原生格式双向转换、协议格式对比表、三个设计收益分析*
 *v3.2 | 2026-03-25 | 新增前沿模型对比（Claude 如何跳过防御层）、模型规模与工程重心关系、7B + 循环放大的正面叙事*
 *v3.1 | 2026-03-25 | 5.1 新增 Dense vs MoE 技术原理分析、工业界结构化输出四层防御最佳实践*
 *v3.0 | 2026-03-25 | 新增实践演练方案：Demo 模型选型（Qwen2.5-Coder-7B）、各模块 Demo 策略、MVP 代码库集成、准备清单*
