@@ -22,6 +22,7 @@ Tool call parser —— 从模型原始输出中提取工具调用
 import json
 import re
 from typing import List, Dict, Any, Optional
+from trajectory import trace
 
 
 class ToolCall:
@@ -39,6 +40,40 @@ class ToolCall:
         return f"ToolCall(tool_name={self.tool_name}, parameters={self.parameters})"
 
 
+def _strip_line_comments(text: str) -> str:
+    """
+    去除 JS 风格的单行注释（// ...），但保留 JSON 字符串内的 //。
+
+    7B 模型有时在生成 JSON 时混入 JS 注释，例如：
+        {"file_path": "/tmp/a.py",  // target file
+         "old_string": "x = 1"}
+
+    策略：逐行扫描，追踪引号状态，只删除字符串外的 // 注释。
+
+    注意：JSON 字符串中的 URL（如 "https://..."）不会被误删，
+    因为 // 在引号内时 in_string=True，会被跳过。
+    """
+    lines = text.split('\n')
+    cleaned = []
+    for line in lines:
+        in_string = False
+        i = 0
+        result_line = line
+        while i < len(line):
+            c = line[i]
+            if c == '\\' and in_string:
+                i += 2  # 跳过转义字符
+                continue
+            if c == '"':
+                in_string = not in_string
+            elif c == '/' and not in_string and i + 1 < len(line) and line[i + 1] == '/':
+                result_line = line[:i].rstrip()
+                break
+            i += 1
+        cleaned.append(result_line)
+    return '\n'.join(cleaned)
+
+
 def _sanitize_json(text: str) -> str:
     """
     修复小模型常见的 JSON 畸变。
@@ -48,10 +83,19 @@ def _sanitize_json(text: str) -> str:
     与模型的概率生成机制天然冲突。
 
     处理的畸变类型：
+    0a. JS 单行注释：// comment → 删除（字符串内的 // 保留）
+    0b. JS 块注释：/* comment */ → 删除
     1. Python 三引号字符串：模型生成了 Python 风格而非 JSON 风格的多行字符串
     2. 尾部逗号：{"key": "value",} → JSON 不允许但 Python/JS 允许
     """
     result = text
+
+    # Fix 0a: 去除 JS 单行注释（// ...），保留字符串内的
+    result = _strip_line_comments(result)
+
+    # Fix 0b: 去除 JS 块注释（/* ... */）
+    # JSON 中 /* 和 */ 不可能合法出现在字符串外，安全删除
+    result = re.sub(r'/\*.*?\*/', '', result, flags=re.DOTALL)
 
     # Fix 1: 将 Python 三引号字符串转为 JSON 字符串
     # 例如 """line1\nline2""" → "line1\\nline2"
@@ -67,6 +111,10 @@ def _sanitize_json(text: str) -> str:
 
     # Fix 2: 删除 } 或 ] 前的尾部逗号
     result = re.sub(r',\s*([}\]])', r'\1', result)
+
+    if result != text:
+        trace("_sanitize_json applied fixes",
+              original_len=len(text), result_len=len(result))
 
     return result
 
@@ -161,6 +209,7 @@ def parse_tool_calls(text: str) -> List[ToolCall]:
         解析出的 ToolCall 列表（可能为空）
     """
     tool_calls = []
+    strategy_used = None
 
     # ── 策略一：XML 标签 ─────────────────────────────────────────
     # 标准格式：<tool_call>...</tool_call>
@@ -180,9 +229,13 @@ def parse_tool_calls(text: str) -> List[ToolCall]:
             if tc:
                 tool_calls.append(tc)
 
+    if tool_calls:
+        strategy_used = "XML"
+
     # ── 策略二：代码块 ───────────────────────────────────────────
+    # \w+ 匹配任意语言标识符（json/python/bash/javascript/text 等）
     if not tool_calls:
-        code_block_pattern = r'```(?:python|json|bash)?\s*\n(.*?)\n```'
+        code_block_pattern = r'```(?:\w+)?\s*\n(.*?)\n```'
         code_matches = re.findall(code_block_pattern, text, re.DOTALL)
         for match in code_matches:
             data = _try_parse_json(match)
@@ -196,6 +249,9 @@ def parse_tool_calls(text: str) -> List[ToolCall]:
                         tc = _extract_tool_call(item)
                         if tc:
                             tool_calls.append(tc)
+
+        if tool_calls:
+            strategy_used = "code_block"
 
     # ── 策略三：裸 JSON（花括号配对）─────────────────────────────
     if not tool_calls:
@@ -218,6 +274,16 @@ def parse_tool_calls(text: str) -> List[ToolCall]:
                     tc = _extract_tool_call(data)
                     if tc:
                         tool_calls.append(tc)
+
+        if tool_calls:
+            strategy_used = "bare_JSON"
+
+    # ── 轨迹日志 ─────────────────────────────────────────────────
+    trace("parse_tool_calls",
+          strategy=strategy_used or "none",
+          count=len(tool_calls),
+          tools=", ".join(tc.tool_name for tc in tool_calls) if tool_calls else "none",
+          input_len=len(text))
 
     return tool_calls
 
@@ -249,7 +315,7 @@ def extract_text_and_tool_calls(text: str) -> tuple[str, List[ToolCall]]:
         return data is not None and isinstance(data, dict) and ("tool" in data or "name" in data)
 
     code_blocks = list(re.finditer(
-        r'```(?:python|json|bash)?\s*\n(.*?)\n```', clean_text, re.DOTALL
+        r'```(?:\w+)?\s*\n(.*?)\n```', clean_text, re.DOTALL
     ))
     for match in reversed(code_blocks):
         if should_remove_block(match):

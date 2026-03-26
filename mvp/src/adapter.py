@@ -66,9 +66,11 @@ Claude ↔ Qwen 协议适配层
 """
 
 import uuid
+import re
 import json
 from typing import List, Dict, Any, Optional
-from parser import parse_tool_calls
+from parser import parse_tool_calls, _try_parse_json, _extract_tool_call
+from trajectory import trace
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +233,12 @@ def qwen_response_to_claude(raw_text: str) -> Dict[str, Any]:
     - 如果包含 tool_use → stop_reason = "tool_use"
     - 如果不包含 → stop_reason = "end_turn"
 
+    文本提取策略（v2 重构）：
+    - 从原始文本中剥离所有已识别的工具调用模式（XML 标签、代码块）
+    - 剩余的文本即为 text content block
+    - 这比之前基于标记位置查找的方式更鲁棒，
+      尤其是对代码块格式的工具调用
+
     Args:
         raw_text: Qwen 模型生成的原始文本（可能包含 <tool_call> 标签）
 
@@ -245,8 +253,6 @@ def qwen_response_to_claude(raw_text: str) -> Dict[str, Any]:
     content_blocks = []
 
     # 使用 parser.py 的鲁棒解析提取工具调用
-    # parser 支持三种格式：XML 标签、代码块、裸 JSON——
-    # 用 Qwen 原生格式后主要命中 XML 路径，但保留其他路径作为 fallback
     tool_calls = parse_tool_calls(raw_text)
 
     if not tool_calls:
@@ -254,60 +260,65 @@ def qwen_response_to_claude(raw_text: str) -> Dict[str, Any]:
         clean_text = raw_text.strip()
         if clean_text:
             content_blocks.append({"type": "text", "text": clean_text})
+
+        trace("qwen_response_to_claude",
+              raw_len=len(raw_text), text_blocks=len(content_blocks),
+              tool_use_blocks=0, stop_reason="end_turn")
+
         return {
             "role": "assistant",
             "content": content_blocks,
             "stop_reason": "end_turn"
         }
 
-    # 有工具调用——需要分离文本部分和工具调用部分
-    # 策略：找到第一个 <tool_call> 之前的文本作为 text block
-    remaining_text = raw_text
+    # ── 从原始文本中剥离工具调用模式，提取纯文本 ──────────────────
+    clean_text = raw_text
+
+    # 剥离 XML 标签格式：<tool_call>...</tool_call>
+    clean_text = re.sub(r'<tool_call>.*?</tool_call>', '', clean_text, flags=re.DOTALL)
+    # 剥离孤立闭标签变体
+    clean_text = re.sub(
+        r'\{[^<]*?(?:"tool"|"name")[^<]*?\}\s*</tool_call>',
+        '', clean_text, flags=re.DOTALL
+    )
+
+    # 剥离包含工具调用的代码块
+    def _is_tool_call_block(match):
+        content = match.group(1)
+        data = _try_parse_json(content)
+        if data and isinstance(data, dict):
+            return _extract_tool_call(data) is not None
+        return False
+
+    for match in reversed(list(re.finditer(
+            r'```(?:\w+)?\s*\n(.*?)\n```', clean_text, re.DOTALL))):
+        if _is_tool_call_block(match):
+            clean_text = clean_text[:match.start()] + clean_text[match.end():]
+
+    clean_text = clean_text.strip()
+
+    # ── 构建 content blocks：text 在前，tool_use 在后 ─────────────
+    if clean_text:
+        content_blocks.append({"type": "text", "text": clean_text})
 
     for tc in tool_calls:
-        # 尝试找到这个 tool_call 在原文中的位置，提取前面的文本
-        # 查找 <tool_call> 标签或 JSON 块的起始位置
-        markers = ["<tool_call>", '{"name"', "{'name'"]
-        split_pos = -1
-        for marker in markers:
-            pos = remaining_text.find(marker)
-            if pos != -1 and (split_pos == -1 or pos < split_pos):
-                split_pos = pos
-
-        if split_pos > 0:
-            # <tool_call> 之前有文本，作为 text block
-            preceding_text = remaining_text[:split_pos].strip()
-            if preceding_text:
-                content_blocks.append({"type": "text", "text": preceding_text})
-
-        # 添加 tool_use block
-        # 从 parser 的 ToolCall 对象转换为 Claude 的 tool_use content block
-        tool_use_block = {
+        content_blocks.append({
             "type": "tool_use",
             "id": _generate_tool_use_id(),
             "name": tc.tool_name,
             "input": tc.parameters
-        }
-        content_blocks.append(tool_use_block)
+        })
 
-        # 移动 remaining_text 到这个 tool_call 之后
-        # 查找 </tool_call> 的结束位置
-        end_marker = "</tool_call>"
-        end_pos = remaining_text.find(end_marker)
-        if end_pos != -1:
-            remaining_text = remaining_text[end_pos + len(end_marker):]
-        else:
-            # 没有闭合标签，跳过已处理的部分
-            remaining_text = ""
-
-    # 检查所有 tool_call 之后是否还有文本
-    trailing_text = remaining_text.strip()
-    if trailing_text:
-        content_blocks.append({"type": "text", "text": trailing_text})
-
-    # 如果解析出了 tool_use 但 content_blocks 为空（不应该发生），兜底
+    # 兜底：如果解析出了 tool_use 但 content_blocks 意外为空
     if not content_blocks:
         content_blocks.append({"type": "text", "text": raw_text.strip()})
+
+    tool_use_count = sum(1 for b in content_blocks if b.get("type") == "tool_use")
+    trace("qwen_response_to_claude",
+          raw_len=len(raw_text),
+          text_blocks=sum(1 for b in content_blocks if b.get("type") == "text"),
+          tool_use_blocks=tool_use_count,
+          stop_reason="tool_use")
 
     return {
         "role": "assistant",

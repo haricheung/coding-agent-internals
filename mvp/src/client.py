@@ -41,11 +41,13 @@ ReAct 循环：
 
 import os
 import json
+import time as _time
 import requests
 from typing import List, Dict, Any, Optional
 from tools import get_tools
 from task_tools import get_task_tools, task_store
 from agent_tool import get_agent_tool
+from trajectory import trace
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +276,8 @@ RESPONSE STYLE:
 
         while round_num < max_rounds:
             round_num += 1
+            trace(f"══ Round {round_num}/{max_rounds} ══",
+                  conversation_len=len(self.conversation))
 
             # 构造请求：system prompt + tools + 对话历史
             # system prompt 作为对话的第一条消息
@@ -282,11 +286,21 @@ RESPONSE STYLE:
 
             # ── 发送请求，接收流式响应 ────────────────────────────
             print("\n🤖 ", end="", flush=True)
+            t0 = _time.time()
             response = self._generate(messages)
+            t1 = _time.time()
 
             if response is None:
+                trace("round result: no response")
                 print("\n  ⚠️ No response from server.", flush=True)
                 return None
+
+            # ── 轨迹：记录本轮响应结构 ────────────────────────────
+            content_types = [b.get("type") for b in response.get("content", [])]
+            trace(f"round {round_num} response",
+                  gen_time=f"{t1-t0:.1f}s",
+                  stop_reason=response.get("stop_reason"),
+                  content_blocks=content_types)
 
             # ── 将 assistant 响应加入对话历史 ─────────────────────
             # 存储完整的 content blocks，保持对话历史的结构化
@@ -295,6 +309,7 @@ RESPONSE STYLE:
             # ── 检查是否需要执行工具 ──────────────────────────────
             if response.get("stop_reason") != "tool_use":
                 # 模型认为任务完成（stop_reason: "end_turn"）
+                trace(f"loop exit: stop_reason={response.get('stop_reason')}")
                 return None
 
             # ── 执行工具调用 ──────────────────────────────────────
@@ -308,11 +323,24 @@ RESPONSE STYLE:
                 tool_input = block["input"]
                 tool_use_id = block["id"]
 
+                trace(f"executing tool",
+                      tool=tool_name,
+                      params=str(tool_input)[:100])
+
                 print(f"\n  🔧 Executing {tool_name}...", flush=True)
+                t_tool_0 = _time.time()
                 result = self._execute_tool(tool_name, tool_input)
+                t_tool_1 = _time.time()
 
                 # 判断执行是否出错
                 is_error = result.startswith("Error")
+
+                trace(f"tool result",
+                      tool=tool_name,
+                      is_error=is_error,
+                      result_len=len(result),
+                      time=f"{t_tool_1-t_tool_0:.2f}s")
+
                 if is_error:
                     print(f"  ❌ {result}", flush=True)
                 else:
@@ -335,6 +363,7 @@ RESPONSE STYLE:
                 "content": tool_results
             })
 
+        trace("loop exit: max_rounds reached", rounds=max_rounds)
         print("\n  ⚠️ Reached maximum rounds. Stopping.", flush=True)
         return None
 

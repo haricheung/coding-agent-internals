@@ -24,6 +24,7 @@ Usage:
 import sys
 import json
 import argparse
+import time as _time
 from threading import Thread
 
 import torch
@@ -39,6 +40,7 @@ from adapter import (
     claude_messages_to_qwen,
     qwen_response_to_claude,
 )
+from trajectory import trace
 
 
 app = FastAPI()
@@ -116,6 +118,7 @@ def generate_stream(request: GenerateRequest):
 
     # ── Step 1: 入口转换 ──────────────────────────────────────────
     # 将 Claude 格式转为 Qwen 格式
+    t0 = _time.time()
 
     # 转换工具定义
     qwen_tools = None
@@ -124,6 +127,10 @@ def generate_stream(request: GenerateRequest):
 
     # 转换消息（处理 content blocks → 纯文本 + tool_calls 结构）
     qwen_messages = claude_messages_to_qwen(request.messages)
+
+    trace("generate_stream: input conversion",
+          tools=len(request.tools) if request.tools else 0,
+          messages=len(request.messages))
 
     # ── Step 2: 模板渲染 ──────────────────────────────────────────
     # Qwen 的 chat template (Jinja2) 会自动处理：
@@ -143,6 +150,9 @@ def generate_stream(request: GenerateRequest):
 
     text = tokenizer.apply_chat_template(qwen_messages, **template_kwargs)
     inputs = tokenizer(text, return_tensors="pt").to(model.device)
+
+    trace("generate_stream: template rendered",
+          input_tokens=inputs["input_ids"].shape[-1])
 
     # ── Step 3: 流式推理 ──────────────────────────────────────────
     # TextIteratorStreamer 让我们在生成过程中逐 token 读取输出，
@@ -186,7 +196,17 @@ def generate_stream(request: GenerateRequest):
     # - 生成 tool_use_id 用于后续的 tool_result 关联
     # - 设置 stop_reason（tool_use / end_turn）
 
+    t1 = _time.time()
+    trace("generate_stream: raw output",
+          gen_time=f"{t1-t0:.1f}s",
+          output_len=len(full_text),
+          preview=repr(full_text[:200]))
+
     claude_response = qwen_response_to_claude(full_text.strip())
+
+    trace("generate_stream: done",
+          stop_reason=claude_response.get("stop_reason"),
+          content_blocks=len(claude_response.get("content", [])))
 
     # 发送最终的结构化响应
     yield f"data: {json.dumps({'done': True, 'response': claude_response})}\n\n"
@@ -226,7 +246,13 @@ def main():
     parser.add_argument("model_path", help="Path to the Qwen model")
     parser.add_argument("--port", type=int, default=9981, help="Server port (default: 9981)")
     parser.add_argument("--host", default="0.0.0.0", help="Server host (default: 0.0.0.0)")
+    parser.add_argument("--trace", action="store_true",
+                        help="Enable trajectory logging (dim [TRACE] lines)")
     args = parser.parse_args()
+
+    if args.trace:
+        import trajectory
+        trajectory.enable()
 
     load_model(args.model_path)
     uvicorn.run(app, host=args.host, port=args.port)

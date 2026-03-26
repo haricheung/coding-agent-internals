@@ -15,9 +15,15 @@ def main():
     parser = argparse.ArgumentParser(description="Claude Code MVP - Day 1 REPL")
     parser.add_argument("--server", default="http://localhost:9981",
                         help="Model server URL (default: http://localhost:9981)")
+    parser.add_argument("--trace", action="store_true",
+                        help="Enable trajectory logging (dim [TRACE] lines)")
     parser.add_argument("working_dir", nargs="?", default=os.getcwd(),
                         help="Working directory for the agent (default: cwd)")
     args = parser.parse_args()
+
+    if args.trace:
+        import trajectory
+        trajectory.enable()
 
     working_dir = os.path.abspath(args.working_dir)
 

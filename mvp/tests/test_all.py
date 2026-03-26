@@ -541,6 +541,63 @@ class TestParser(unittest.TestCase):
         )
         self.assertEqual(len(tc), 1)
 
+    def test_sanitize_js_line_comment(self):
+        """JS 单行注释修复：// comment 应被剥离后正确解析。"""
+        from parser import parse_tool_calls
+        tc = parse_tool_calls(
+            '<tool_call>{"name": "Edit", "arguments": {\n'
+            '  "file_path": "/tmp/a.py",  // target file\n'
+            '  "old_string": "x = 1",\n'
+            '  "new_string": "x = 2"\n'
+            '}}</tool_call>'
+        )
+        self.assertEqual(len(tc), 1)
+        self.assertEqual(tc[0].tool_name, 'Edit')
+        self.assertEqual(tc[0].parameters['file_path'], '/tmp/a.py')
+
+    def test_sanitize_js_line_comment_preserves_urls(self):
+        """JS 注释剥离不应破坏字符串内的 // (如 URL)。"""
+        from parser import parse_tool_calls
+        tc = parse_tool_calls(
+            '<tool_call>{"name": "Bash", "arguments": {'
+            '"command": "curl https://example.com/api"'
+            '}}</tool_call>'
+        )
+        self.assertEqual(len(tc), 1)
+        self.assertIn('https://example.com/api', tc[0].parameters['command'])
+
+    def test_sanitize_js_block_comment(self):
+        """JS 块注释修复：/* ... */ 应被剥离后正确解析。"""
+        from parser import parse_tool_calls
+        tc = parse_tool_calls(
+            '<tool_call>{"name": "Read", "arguments": '
+            '{"file_path": /* path */ "/tmp/a.py"}}</tool_call>'
+        )
+        self.assertEqual(len(tc), 1)
+        self.assertEqual(tc[0].tool_name, 'Read')
+
+    def test_code_block_any_language(self):
+        """代码块：非标准语言标识符（javascript）应能匹配。"""
+        from parser import parse_tool_calls
+        tc = parse_tool_calls(
+            '```javascript\n{"name": "Bash", "arguments": {"command": "ls"}}\n```'
+        )
+        self.assertEqual(len(tc), 1)
+        self.assertEqual(tc[0].tool_name, 'Bash')
+
+    def test_code_block_with_js_comments(self):
+        """代码块 + JS 注释：两重修复叠加。"""
+        from parser import parse_tool_calls
+        tc = parse_tool_calls(
+            '```json\n{"name": "Edit", "arguments": {\n'
+            '  "file_path": "/tmp/a.py",  // This must appear exactly once\n'
+            '  "old_string": "total += numbers[i + 1]",\n'
+            '  "new_string": "total += numbers[i]"\n'
+            '}}\n```'
+        )
+        self.assertEqual(len(tc), 1)
+        self.assertEqual(tc[0].tool_name, 'Edit')
+
 
 class TestAdapter(unittest.TestCase):
     """
@@ -638,6 +695,38 @@ class TestAdapter(unittest.TestCase):
         )
         tool_uses = [b for b in resp['content'] if b['type'] == 'tool_use']
         self.assertEqual(len(tool_uses), 2)
+
+    def test_response_code_block_tool_use(self):
+        """代码块格式的 tool_call → 正确返回 tool_use + stop_reason。"""
+        from adapter import qwen_response_to_claude
+        resp = qwen_response_to_claude(
+            'I will run the command.\n'
+            '```json\n{"name": "Bash", "arguments": {"command": "ls"}}\n```'
+        )
+        self.assertEqual(resp['stop_reason'], 'tool_use')
+        tool_uses = [b for b in resp['content'] if b['type'] == 'tool_use']
+        self.assertEqual(len(tool_uses), 1)
+        self.assertEqual(tool_uses[0]['name'], 'Bash')
+        # 前面的文本应作为 text block
+        text_blocks = [b for b in resp['content'] if b['type'] == 'text']
+        self.assertTrue(len(text_blocks) >= 1)
+        self.assertIn('I will run the command', text_blocks[0]['text'])
+
+    def test_response_code_block_with_js_comments(self):
+        """代码块 + JS 注释：完整链路测试（解析成功 + stop_reason=tool_use）。"""
+        from adapter import qwen_response_to_claude
+        resp = qwen_response_to_claude(
+            'Sure! I will fix the bug.\n'
+            '```json\n{"name": "Edit", "arguments": {\n'
+            '  "file_path": "/tmp/a.py",  // target file\n'
+            '  "old_string": "x = 1",\n'
+            '  "new_string": "x = 2"\n'
+            '}}\n```'
+        )
+        self.assertEqual(resp['stop_reason'], 'tool_use')
+        tool_uses = [b for b in resp['content'] if b['type'] == 'tool_use']
+        self.assertEqual(len(tool_uses), 1)
+        self.assertEqual(tool_uses[0]['name'], 'Edit')
 
 
 # ===========================================================================
