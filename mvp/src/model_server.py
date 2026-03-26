@@ -1,39 +1,50 @@
 #!/usr/bin/env python3
 """
-Model Server —— 模型推理服务 + Claude ↔ Qwen 协议适配
+Model Server —— 模型推理服务 + Claude ↔ Qwen 协议适配 + Dashboard
 
-本服务在模型与客户端之间扮演两个角色：
+本服务扮演三个角色：
 1. 推理引擎：加载 Qwen 模型到 GPU，通过 HTTP 提供推理服务
 2. 协议适配：将客户端发来的 Claude tool_use 格式转为 Qwen 原生格式，
              推理完成后再将 Qwen 的原始输出转回 Claude 格式
+3. Dashboard：提供 Web UI 展示测试结果和 agent 轨迹
 
 架构图：
     Client ──Claude格式──→ Model Server ──Qwen格式──→ Qwen Model
                               ↑ adapter.py
     Client ←──Claude格式── Model Server ←──原始文本── Qwen Model
-
-这个适配层做的事情，本质上就是 Anthropic API 基础设施在做的：
-把模型的原始文本输出结构化为 typed content blocks。
-区别在于 Anthropic 有前沿模型 + 约束解码做确定性保证，
-我们有 7B 模型 + 鲁棒解析做概率性兜底。
+                              ↑
+    Browser ──────────────→ /dashboard (Web UI)
+                           /api/trajectories | /api/stats | /api/tests
 
 Usage:
     python model_server.py <model_path> [--port 9981]
 """
 
 import sys
+import os
 import json
-import argparse
+import glob
+import re
 import time as _time
+import argparse
+import subprocess
 from threading import Thread
+from pathlib import Path
+from datetime import datetime
+from typing import List, Dict, Any, Optional
 
 import torch
 import uvicorn
 from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer
+
+# vLLM lazy import (only when --backend vllm is used)
+vllm_model = None  # vllm.LLM instance
+BACKEND = "vllm"   # "hf" or "vllm"
 
 from adapter import (
     claude_tools_to_qwen,
@@ -43,7 +54,8 @@ from adapter import (
 from trajectory import trace
 
 
-app = FastAPI()
+app = FastAPI(title="Coding Agent Model Server + Dashboard")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 model = None
 tokenizer = None
 
@@ -66,7 +78,7 @@ class GenerateRequest(BaseModel):
     tools: Optional[List[Dict[str, Any]]] = None  # Claude 格式的工具定义
     messages: List[Dict[str, Any]]                  # 支持 content blocks 的消息列表
     max_new_tokens: int = 2048
-    temperature: float = 0.7
+    temperature: float = 0.3
 
 
 # ---------------------------------------------------------------------------
@@ -75,20 +87,56 @@ class GenerateRequest(BaseModel):
 
 def load_model(model_path: str):
     """
-    加载 Qwen 模型和 tokenizer 到 GPU。
+    加载 Qwen 模型和 tokenizer。
 
-    模型只加载一次，后续请求复用。这是推理服务的基本模式——
-    模型加载耗时数分钟（取决于模型大小和 GPU），但推理响应只需数秒。
+    支持两种后端：
+    - hf: HuggingFace transformers（默认，兼容性好）
+    - vllm: vLLM 引擎（3-5x 加速，推荐用于 30B+ 模型）
     """
-    global model, tokenizer
-    print(f"Loading model from {model_path}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        dtype=torch.bfloat16,
-        device_map="auto"
-    )
-    print("Model loaded successfully!")
+    global model, tokenizer, vllm_model, BACKEND
+    t0 = _time.time()
+    print(f"Loading model from {model_path} (backend={BACKEND})...")
+
+    if BACKEND == "vllm":
+        print("  [1/2] Initializing vLLM engine...", flush=True)
+        try:
+            from vllm import LLM
+            vllm_model = LLM(
+                model=model_path,
+                dtype="auto",
+                trust_remote_code=True,
+                max_model_len=32768,
+                max_num_seqs=16,
+                gpu_memory_utilization=0.90,
+                enforce_eager=True,
+            )
+            tokenizer = vllm_model.get_tokenizer()
+            print(f"  [2/2] vLLM ready! Total time: {_time.time()-t0:.1f}s", flush=True)
+        except Exception as e:
+            err_msg = str(e).lower()
+            if "not supported" in err_msg or "not implemented" in err_msg:
+                print(f"  ⚠️  vLLM does not support this model: {e}", flush=True)
+                print("  Falling back to HuggingFace backend...", flush=True)
+                BACKEND = "hf"
+                vllm_model = None
+            else:
+                raise
+
+    if BACKEND == "hf":
+        print("  [1/3] Loading tokenizer...", flush=True)
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        print(f"  [1/3] Tokenizer ready ({_time.time()-t0:.1f}s)", flush=True)
+
+        print("  [2/3] Loading model weights (this may take a few minutes)...", flush=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            dtype=torch.bfloat16,
+            device_map="auto"
+        )
+        print(f"  [2/3] Model weights loaded ({_time.time()-t0:.1f}s)", flush=True)
+
+        gpu_mem = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0
+        print(f"  [3/3] Model ready! GPU memory: {gpu_mem:.1f} GB | Total time: {_time.time()-t0:.1f}s", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -99,33 +147,18 @@ def generate_stream(request: GenerateRequest):
     """
     核心推理流程：Claude 格式输入 → Qwen 推理 → Claude 格式输出。
 
-    处理步骤：
-    1. [入口转换] Claude 格式的 tools → Qwen 格式的 function definitions
-    2. [入口转换] Claude 格式的 messages → Qwen chat template 格式
-    3. [模板渲染] apply_chat_template 将消息 + 工具定义渲染为模型输入
-    4. [推理] 模型生成 token，通过 SSE 实时流式返回给客户端
-    5. [出口转换] 完整文本 → 解析 <tool_call> → Claude content blocks
-
-    流式输出设计：
-    - 推理过程中：逐 token 发送 {"token": "..."} 事件（客户端实时打印）
-    - 推理结束后：发送 {"done": true, "response": {...}} 事件
-      其中 response 是 Claude 格式的结构化响应（content blocks）
-
-    这样客户端同时获得：
-    - 实时 token 流（Live Demo 的视觉效果）
-    - 结构化响应（工具调用的可靠解析）
+    支持两种后端：
+    - hf: HuggingFace transformers（逐 token 流式）
+    - vllm: vLLM 引擎（批量生成，3-5x 加速）
     """
 
     # ── Step 1: 入口转换 ──────────────────────────────────────────
-    # 将 Claude 格式转为 Qwen 格式
     t0 = _time.time()
 
-    # 转换工具定义
     qwen_tools = None
     if request.tools:
         qwen_tools = claude_tools_to_qwen(request.tools)
 
-    # 转换消息（处理 content blocks → 纯文本 + tool_calls 结构）
     qwen_messages = claude_messages_to_qwen(request.messages)
 
     trace("generate_stream: input conversion",
@@ -133,14 +166,6 @@ def generate_stream(request: GenerateRequest):
           messages=len(request.messages))
 
     # ── Step 2: 模板渲染 ──────────────────────────────────────────
-    # Qwen 的 chat template (Jinja2) 会自动处理：
-    # - 如果有 tools：在 system prompt 中注入 <tools></tools> 块和格式说明
-    # - tool_calls 在 assistant 消息中渲染为 <tool_call></tool_call>
-    # - tool role 消息渲染为 <tool_response></tool_response>
-    #
-    # 这就是"顺应模型训练分布"的关键——用模型训练时见过的格式，
-    # 而非 system prompt 硬教的自定义格式
-
     template_kwargs = {
         "tokenize": False,
         "add_generation_prompt": True,
@@ -149,45 +174,60 @@ def generate_stream(request: GenerateRequest):
         template_kwargs["tools"] = qwen_tools
 
     text = tokenizer.apply_chat_template(qwen_messages, **template_kwargs)
-    inputs = tokenizer(text, return_tensors="pt").to(model.device)
 
-    trace("generate_stream: template rendered",
-          input_tokens=inputs["input_ids"].shape[-1])
+    if BACKEND == "vllm":
+        # ── vLLM 路径：高速批量生成 ─────────────────────────────
+        from vllm import SamplingParams
+        params = SamplingParams(
+            max_tokens=request.max_new_tokens,
+            temperature=max(request.temperature, 0.01),
+        )
 
-    # ── Step 3: 流式推理 ──────────────────────────────────────────
-    # TextIteratorStreamer 让我们在生成过程中逐 token 读取输出，
-    # skip_prompt=True 跳过输入部分，skip_special_tokens=True 跳过 <|im_end|> 等
+        trace("generate_stream: vllm generating",
+              prompt_len=len(text))
 
-    streamer = TextIteratorStreamer(
-        tokenizer,
-        skip_prompt=True,
-        skip_special_tokens=True
-    )
+        outputs = vllm_model.generate([text], params, use_tqdm=False)
+        full_text = outputs[0].outputs[0].text
 
-    gen_kwargs = dict(
-        **inputs,
-        max_new_tokens=request.max_new_tokens,
-        temperature=request.temperature,
-        do_sample=True,
-        pad_token_id=tokenizer.eos_token_id,
-        streamer=streamer
-    )
+        # 逐 chunk 发送（模拟流式效果）
+        chunk_size = 4
+        for i in range(0, len(full_text), chunk_size):
+            chunk = full_text[i:i+chunk_size]
+            yield f"data: {json.dumps({'token': chunk})}\n\n"
 
-    # 在后台线程中运行生成，主线程通过 streamer 迭代读取 token
-    thread = Thread(target=model.generate, kwargs=gen_kwargs)
-    thread.start()
+    else:
+        # ── HuggingFace 路径：逐 token 流式 ─────────────────────
+        inputs = tokenizer(text, return_tensors="pt").to(model.device)
 
-    # ── Step 4: 逐 token 流式输出 ────────────────────────────────
-    full_text = ""
-    for chunk in streamer:
-        full_text += chunk
-        # 实时发送每个 token 给客户端（SSE 格式）
-        # 客户端收到后立即打印到终端，营造"模型在思考"的视觉效果
-        yield f"data: {json.dumps({'token': chunk})}\n\n"
+        trace("generate_stream: template rendered",
+              input_tokens=inputs["input_ids"].shape[-1])
 
-    thread.join()
+        streamer = TextIteratorStreamer(
+            tokenizer,
+            skip_prompt=True,
+            skip_special_tokens=True
+        )
 
-    # ── Step 5: 出口转换 ──────────────────────────────────────────
+        gen_kwargs = dict(
+            **inputs,
+            max_new_tokens=request.max_new_tokens,
+            temperature=request.temperature,
+            do_sample=True,
+            pad_token_id=tokenizer.eos_token_id,
+            streamer=streamer
+        )
+
+        thread = Thread(target=model.generate, kwargs=gen_kwargs)
+        thread.start()
+
+        full_text = ""
+        for chunk in streamer:
+            full_text += chunk
+            yield f"data: {json.dumps({'token': chunk})}\n\n"
+
+        thread.join()
+
+    # ── Step 3: 出口转换 ──────────────────────────────────────────
     # 推理结束后，将 Qwen 的原始文本输出转为 Claude 格式的结构化响应
     #
     # 这一步是适配层的核心：
@@ -234,7 +274,191 @@ async def generate(request: GenerateRequest):
 @app.get("/health")
 async def health():
     """健康检查端点，客户端启动时调用以确认服务可用。"""
-    return {"status": "ok", "model_loaded": model is not None}
+    return {"status": "ok", "model_loaded": model is not None or vllm_model is not None}
+
+
+# ---------------------------------------------------------------------------
+# Dashboard —— 测试可视化面板
+# ---------------------------------------------------------------------------
+
+SCRIPT_DIR = Path(__file__).parent.resolve()
+TRAJ_DIR = SCRIPT_DIR / ".." / "tests" / "trajectories"
+TESTS_DIR = SCRIPT_DIR / ".." / "tests"
+
+_traj_cache: Dict[str, Any] = {}
+_traj_cache_time: float = 0
+_test_results: Dict[str, Any] = {}
+CACHE_TTL = 5
+
+
+def _load_trajectories() -> Dict[str, Any]:
+    global _traj_cache, _traj_cache_time
+    now = _time.time()
+    if _traj_cache and (now - _traj_cache_time) < CACHE_TTL:
+        return _traj_cache
+    result = {}
+    for fp in sorted(glob.glob(str(TRAJ_DIR / "session_*.json")), reverse=True):
+        try:
+            with open(fp) as f:
+                data = json.load(f)
+            result[data.get("session_id", Path(fp).stem)] = data
+        except (json.JSONDecodeError, IOError):
+            continue
+    _traj_cache = result
+    _traj_cache_time = now
+    return result
+
+
+def _compute_stats(trajectories: Dict[str, Any]) -> Dict[str, Any]:
+    total_sessions = len(trajectories)
+    if total_sessions == 0:
+        return {"total_sessions": 0}
+    total_rounds = total_tool_calls = total_errors = 0
+    total_duration = 0.0
+    tool_usage: Dict[str, int] = {}
+    durations: list[float] = []
+    for data in trajectories.values():
+        s = data.get("summary", {})
+        total_rounds += s.get("total_rounds", 0)
+        total_tool_calls += s.get("tool_calls", 0)
+        dur = s.get("duration", 0)
+        total_duration += dur
+        durations.append(dur)
+        for rnd in data.get("rounds", []):
+            for a in rnd.get("actions", []):
+                t = a.get("tool", "unknown")
+                tool_usage[t] = tool_usage.get(t, 0) + 1
+                if a.get("is_error"):
+                    total_errors += 1
+    actual = sum(tool_usage.values()) or 1
+    return {
+        "total_sessions": total_sessions, "total_tool_calls": total_tool_calls,
+        "total_rounds": total_rounds,
+        "avg_duration": round(total_duration / total_sessions, 1),
+        "avg_rounds": round(total_rounds / total_sessions, 1),
+        "avg_tool_calls": round(total_tool_calls / total_sessions, 1),
+        "error_rate": round(total_errors / actual * 100, 1),
+        "tool_usage": dict(sorted(tool_usage.items(), key=lambda x: -x[1])),
+        "durations": sorted(durations),
+    }
+
+
+class TestRunRequest(BaseModel):
+    suite: str = "unit"
+    server_url: Optional[str] = "http://localhost:9981"
+
+
+def _parse_unittest_output(output: str) -> Dict[str, Any]:
+    details = []
+    for m in re.finditer(
+        r'^(test_\w+)\s+\((?:__main__\.)?(\w+)\)\n.*?\.\.\.\s+(ok|FAIL|ERROR)',
+        output, re.MULTILINE
+    ):
+        details.append({"method": m.group(1), "class": m.group(2),
+                        "status": "pass" if m.group(3) == "ok" else "fail"})
+    passed = sum(1 for d in details if d["status"] == "pass")
+    sm = re.search(r'Ran (\d+) tests? in ([\d.]+)s', output)
+    return {"total": int(sm.group(1)) if sm else len(details),
+            "passed": passed, "failed": len(details) - passed, "details": details}
+
+
+def _parse_readme_output(output: str) -> Dict[str, Any]:
+    details = []
+    for m in re.finditer(r'^\s+([✅❌])\s+(.+)$', output, re.MULTILINE):
+        details.append({"name": m.group(2).strip(),
+                        "status": "pass" if m.group(1) == "✅" else "fail"})
+    passed = sum(1 for d in details if d["status"] == "pass")
+    mp = re.search(r'Day 1 minimum pass.*?(✅ PASS|❌ FAIL)', output)
+    return {"total": len(details), "passed": passed, "failed": len(details) - passed,
+            "min_pass": bool(mp and "PASS" in mp.group(1)), "details": details}
+
+
+@app.get("/dashboard")
+async def dashboard():
+    """Dashboard Web UI."""
+    return FileResponse(SCRIPT_DIR / "dashboard.html", media_type="text/html")
+
+
+@app.get("/api/trajectories")
+async def list_trajectories():
+    trajs = _load_trajectories()
+    # Build child_session_ids by scanning all trajectories
+    children_map: Dict[str, List[str]] = {}  # parent_sid -> [child_sids]
+    for sid, d in trajs.items():
+        psid = d.get("parent_session_id")
+        if psid:
+            children_map.setdefault(psid, []).append(sid)
+    return [{"session_id": sid, "start_time": d.get("start_time", ""),
+             "user_input": d.get("user_input", ""), "summary": d.get("summary", {}),
+             "parent_session_id": d.get("parent_session_id"),
+             "child_session_ids": children_map.get(sid, [])}
+            for sid, d in trajs.items()]
+
+
+@app.get("/api/trajectories/{session_id}")
+async def get_trajectory(session_id: str):
+    trajs = _load_trajectories()
+    data = trajs.get(session_id)
+    if not data:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+
+    # Collect child sessions for this parent (by parent_session_id field)
+    child_trajs = [v for v in trajs.values()
+                   if v.get("parent_session_id") == session_id]
+    child_idx = 0  # index into child_trajs for fallback matching
+
+    # Embed sub-agent trajectories inline for Agent tool actions
+    for rnd in data.get("rounds", []):
+        for action in rnd.get("actions", []):
+            if action.get("tool") != "Agent":
+                continue
+            # Primary: match by explicit sub_session_id
+            sub_sid = action.get("sub_session_id")
+            if sub_sid and sub_sid in trajs:
+                action["sub_trajectory"] = trajs[sub_sid]
+            # Fallback: for old trajectories without sub_session_id,
+            # match child sessions by order of appearance
+            elif not sub_sid and child_idx < len(child_trajs):
+                action["sub_trajectory"] = child_trajs[child_idx]
+                child_idx += 1
+    return data
+
+
+@app.get("/api/stats")
+async def get_stats():
+    return _compute_stats(_load_trajectories())
+
+
+@app.get("/api/tests/results")
+async def get_test_results():
+    return _test_results if _test_results else {"status": "no_results"}
+
+
+@app.post("/api/tests/run")
+async def run_tests(req: TestRunRequest):
+    global _test_results
+    if req.suite == "unit":
+        cmd = [sys.executable, str(TESTS_DIR / "test_all.py")]
+        timeout = 120
+    elif req.suite == "live":
+        cmd = [sys.executable, str(TESTS_DIR / "test_readme.py"),
+               "--server", req.server_url or "http://localhost:9981"]
+        timeout = 600
+    else:
+        return JSONResponse({"error": f"Unknown suite: {req.suite}"}, status_code=400)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=timeout, cwd=str(TESTS_DIR))
+        output = result.stdout + "\n" + result.stderr
+    except subprocess.TimeoutExpired:
+        return JSONResponse({"error": "Test run timed out"}, status_code=504)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+    parsed = _parse_unittest_output(output) if req.suite == "unit" else _parse_readme_output(output)
+    parsed.update(suite=req.suite, timestamp=datetime.now().isoformat(),
+                  raw_output=output[-5000:])
+    _test_results[req.suite] = parsed
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -246,9 +470,14 @@ def main():
     parser.add_argument("model_path", help="Path to the Qwen model")
     parser.add_argument("--port", type=int, default=9981, help="Server port (default: 9981)")
     parser.add_argument("--host", default="0.0.0.0", help="Server host (default: 0.0.0.0)")
+    parser.add_argument("--backend", choices=["hf", "vllm"], default="vllm",
+                        help="Inference backend: vllm (default, fast) or hf (HuggingFace, slower)")
     parser.add_argument("--trace", action="store_true",
                         help="Enable trajectory logging (dim [TRACE] lines)")
     args = parser.parse_args()
+
+    global BACKEND
+    BACKEND = args.backend
 
     if args.trace:
         import trajectory

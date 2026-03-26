@@ -178,6 +178,7 @@ def claude_messages_to_qwen(messages: List[Dict[str, Any]]) -> List[Dict[str, An
 
             # Case 2b: user 消息包含 tool_result
             # → 转为 Qwen 的 tool role messages（每个 result 一条）
+            # 如果同时有 text blocks（如意图提醒），追加为 user message
             elif tool_results:
                 for tr in tool_results:
                     # Qwen chat template 会把 tool role 的消息
@@ -192,6 +193,12 @@ def claude_messages_to_qwen(messages: List[Dict[str, Any]]) -> List[Dict[str, An
                     qwen_messages.append({
                         "role": "tool",
                         "content": result_content
+                    })
+                # 如果同时有文本块（如用户意图提醒），作为 user 消息追加
+                if text_parts:
+                    qwen_messages.append({
+                        "role": "user",
+                        "content": "\n".join(text_parts)
                     })
 
             # Case 2c: 纯文本 content blocks（没有 tool_use 也没有 tool_result）
@@ -276,9 +283,14 @@ def qwen_response_to_claude(raw_text: str) -> Dict[str, Any]:
 
     # 剥离 XML 标签格式：<tool_call>...</tool_call>
     clean_text = re.sub(r'<tool_call>.*?</tool_call>', '', clean_text, flags=re.DOTALL)
-    # 剥离孤立闭标签变体
+    # 剥离孤立闭标签变体（JSON 格式）
     clean_text = re.sub(
         r'\{[^<]*?(?:"tool"|"name")[^<]*?\}\s*</tool_call>',
+        '', clean_text, flags=re.DOTALL
+    )
+    # 剥离 Qwen3 格式：<function=Name>...</function> (with or without </tool_call>)
+    clean_text = re.sub(
+        r'<function=\w+>.*?</function>\s*(?:</tool_call>)?',
         '', clean_text, flags=re.DOTALL
     )
 

@@ -47,7 +47,7 @@ from typing import List, Dict, Any, Optional
 from tools import get_tools
 from task_tools import get_task_tools, task_store
 from agent_tool import get_agent_tool
-from trajectory import trace
+from trajectory import trace, Trajectory
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +109,8 @@ class Client:
     所有工具通过统一的 self.tools 字典管理，execute 接口一致。
     """
 
-    def __init__(self, server_url: str = "http://localhost:9981", working_dir: str = None):
+    def __init__(self, server_url: str = "http://localhost:9981", working_dir: str = None,
+                 parent_session_id: str = None):
         """
         初始化客户端。
 
@@ -125,6 +126,7 @@ class Client:
         """
         self.server_url = server_url.rstrip("/")
         self.working_dir = working_dir or os.getcwd()
+        self._parent_session_id = parent_session_id
 
         # ── 加载工具集 ────────────────────────────────────────────────
         # 合并三类工具到统一字典：基础工具 + 任务工具 + Agent 工具
@@ -147,6 +149,9 @@ class Client:
 
         # 对话历史：存储 Claude 格式的消息（含 content blocks）
         self.conversation: List[Dict[str, Any]] = []
+
+        # Issue 14 兜底：一次性纠正标志，防止无限 nudge 循环
+        self._already_nudged = False
 
         # ── 扫描文件树 ───────────────────────────────────────────────
         # ACI 设计：给模型一个项目全景，帮助它定位文件
@@ -203,39 +208,47 @@ class Client:
 
         这使得 system prompt 既是行为指南，也是课程 ACI 设计的活教材。
         """
-        return f"""You are a coding agent that helps users with software engineering tasks.
-You work inside a codebase and use tools to read, write, search, and execute code.
+        return f"""You are a coding agent. You MUST use tools for ALL file operations. You can NEVER output file contents from memory — you MUST call Read to see any file.
 
 Working directory: {self.working_dir}
 
 Files in this project:
 {self._file_tree}
 
-TOOL USAGE RULES:
-1. ALWAYS use tools to act. Never just describe what you would do — actually do it.
-2. NEVER ask the user to paste code or upload files. You have direct filesystem access.
-3. Use the file tree above to locate files. Absolute paths: {self.working_dir}/<relative_path>.
-4. If a filename is partial (e.g., "buggy_code"), match it to the closest file in the tree.
+CRITICAL RULES:
+1. You MUST call a tool in your FIRST response. Never reply with only text.
+2. To see file contents → call Read. NEVER make up or guess file contents.
+3. To list files → call Bash("ls") or Bash("find ..."). NEVER list files from memory.
+4. To modify a file → call Edit. To create a new file → call Write.
+5. To run code → call Bash("python ...").
+6. NEVER ask "which file?" or "could you provide?" or "please specify" — use the file tree above to find files yourself. If the user says "the code" without naming a file, read ALL .py files that are not test files.
+7. Use absolute paths: {self.working_dir}/<relative_path>.
+8. If a filename is partial (e.g., "buggy_code"), match it to the closest file in the tree.
 
-BUG FIX WORKFLOW (L-R-V pattern):
-5. Localize: Use Grep to find relevant code, then Read to examine context.
-6. Repair: Use Edit (NOT Write) to make precise changes. Include enough context in old_string for uniqueness.
-7. Validate: Use Bash to run the code or tests to verify your fix works.
+PROACTIVE FILE DISCOVERY:
+- When user mentions "the code" or "bugs" without specifying a file, you MUST immediately call Read on each non-test .py file ONE BY ONE. Start with buggy_code.py. Do NOT use wildcards or globs — Read only accepts a single file path.
+- ALWAYS call Read FIRST before analyzing or explaining anything.
+
+FOLLOW USER INTENT — do exactly what is asked, nothing more:
+- "Read X" → call Read, show the result. Do NOT analyze or fix.
+- "Find the bug" or "Find bugs" or "analyze bugs" → call Read on ALL non-test code files, then explain bugs. Do NOT fix.
+- "Fix the bug" → call Read to understand, then Edit to fix, then Bash to verify.
+- "Fix the code" → Read all non-test code files, fix bugs you find.
+
+BUG FIX WORKFLOW (only when asked to fix):
+- Localize: Use Grep/Read to find the bug.
+- Repair: Use Edit (not Write) for precise changes.
+- Validate: Use Bash to run the code and verify.
 
 EDITING RULES:
-8. PREFER Edit over Write for modifying existing files. Edit is safer (uniqueness check) and more efficient (sends only the diff).
-9. Only use Write for creating new files or complete rewrites.
+- PREFER Edit over Write for modifying existing files.
+- Only use Write for creating new files.
 
 TASK MANAGEMENT (for complex, multi-step requests):
-10. When given a complex task with multiple sub-tasks, break it down:
-    - Use TaskCreate to create individual sub-tasks
-    - Use TaskUpdate to mark tasks as in_progress when starting, completed when done
-    - Use TaskList to review overall progress
-11. For independent sub-tasks that can run in parallel, use the Agent tool to spawn sub-agents.
+- Use TaskCreate/TaskUpdate/TaskList to break down and track multi-step work.
+- For independent sub-tasks, use the Agent tool to spawn sub-agents.
 
-RESPONSE STYLE:
-12. Keep text responses short and focused on what you found or did.
-13. Show your reasoning briefly before taking action."""
+Keep text responses short. Always act first, explain after."""
 
     def run(self, user_input: str) -> Optional[str]:
         """
@@ -269,6 +282,14 @@ RESPONSE STYLE:
         """
         self.conversation.append({"role": "user", "content": user_input})
 
+        # 重置 nudge 标志（每次 run() 只允许一次纠正）
+        self._already_nudged = False
+
+        # 创建轨迹记录器
+        traj = Trajectory(user_input, save_dir=os.path.join(self.working_dir, "trajectories"),
+                          parent_session_id=self._parent_session_id)
+        self._traj_session_id = traj.session_id
+
         # Circuit Breaker：最大循环轮数
         # Day 3/4 升级：从 5 → 10，适应任务分解 + 多步执行的更长工作流
         max_rounds = 10
@@ -276,6 +297,7 @@ RESPONSE STYLE:
 
         while round_num < max_rounds:
             round_num += 1
+            traj.start_round(round_num)
             trace(f"══ Round {round_num}/{max_rounds} ══",
                   conversation_len=len(self.conversation))
 
@@ -293,6 +315,8 @@ RESPONSE STYLE:
             if response is None:
                 trace("round result: no response")
                 print("\n  ⚠️ No response from server.", flush=True)
+                traj.end_round()
+                traj.finish()
                 return None
 
             # ── 轨迹：记录本轮响应结构 ────────────────────────────
@@ -302,14 +326,51 @@ RESPONSE STYLE:
                   stop_reason=response.get("stop_reason"),
                   content_blocks=content_types)
 
+            # ── 提取思考文本用于轨迹记录 ─────────────────────────
+            thought_parts = []
+            for block in response.get("content", []):
+                if block.get("type") == "text":
+                    thought_parts.append(block.get("text", ""))
+            if thought_parts:
+                traj.record_thought(" ".join(thought_parts))
+
             # ── 将 assistant 响应加入对话历史 ─────────────────────
             # 存储完整的 content blocks，保持对话历史的结构化
             self.conversation.append(response)
 
             # ── 检查是否需要执行工具 ──────────────────────────────
             if response.get("stop_reason") != "tool_use":
+                # ── Issue 14 兜底：检测模型是否在文本中描述了工具调用 ──
+                # 小模型有时会"假装调工具"——在文本中描述 Edit/Write 操作，
+                # 但不发出 <tool_call> token。检测到时注入一次性纠正提示。
+                full_text = " ".join(thought_parts)
+                tool_names = [t for t in self.tools.keys()
+                              if t in ("Edit", "Write", "Bash", "Grep")]
+                mentioned_tools = [t for t in tool_names if t in full_text]
+
+                if mentioned_tools and not self._already_nudged:
+                    self._already_nudged = True
+                    nudge = (
+                        f"You described using {', '.join(mentioned_tools)} "
+                        f"but did not actually call the tool. "
+                        f"Do NOT describe tool calls in text. "
+                        f"You MUST invoke the tool directly. Try again."
+                    )
+                    trace("nudge: model described tool without calling",
+                          mentioned=mentioned_tools)
+                    traj.record_thought(f"[NUDGE] {nudge}")
+                    traj.end_round()
+
+                    self.conversation.append({"role": "user", "content": nudge})
+                    continue  # retry the round
+
                 # 模型认为任务完成（stop_reason: "end_turn"）
+                # 记录最终回答
+                if thought_parts:
+                    traj.record_response(" ".join(thought_parts))
                 trace(f"loop exit: stop_reason={response.get('stop_reason')}")
+                traj.end_round()
+                traj.finish()
                 return None
 
             # ── 执行工具调用 ──────────────────────────────────────
@@ -329,17 +390,31 @@ RESPONSE STYLE:
 
                 print(f"\n  🔧 Executing {tool_name}...", flush=True)
                 t_tool_0 = _time.time()
+                # Agent 工具需要额外传递 parent_session_id
+                if tool_name == "Agent":
+                    tool_input["parent_session_id"] = traj.session_id
                 result = self._execute_tool(tool_name, tool_input)
                 t_tool_1 = _time.time()
 
                 # 判断执行是否出错
                 is_error = result.startswith("Error")
 
+                # 捕获子 Agent 的 session_id（用于轨迹关联）
+                sub_session_id = None
+                if tool_name == "Agent":
+                    agent_tool = self.tools.get("Agent")
+                    sub_session_id = getattr(agent_tool, '_last_sub_session_id', None)
+
                 trace(f"tool result",
                       tool=tool_name,
                       is_error=is_error,
                       result_len=len(result),
                       time=f"{t_tool_1-t_tool_0:.2f}s")
+
+                # 轨迹记录
+                traj.record_action(tool_name, tool_input, result,
+                                   t_tool_1 - t_tool_0, is_error,
+                                   sub_session_id=sub_session_id)
 
                 if is_error:
                     print(f"  ❌ {result}", flush=True)
@@ -356,15 +431,29 @@ RESPONSE STYLE:
                     "is_error": is_error
                 })
 
+            traj.end_round()
+
             # 将所有 tool_result 作为一条 user 消息回传
             # Claude API 的约定：tool_result 放在 user role 的 content blocks 中
+            #
+            # 同时注入用户意图提醒（Issue 15 结构性兜底）：
+            # 小模型在看到工具结果后容易"发散"——读了文件就想分析，
+            # 分析完就想修复。在 tool_result 旁边放一条简短提醒，
+            # 比在 system prompt 里写长段规则有效得多（距离近 = 注意力强）。
+            intent_reminder = {
+                "type": "text",
+                "text": f"[Reminder: user's original request was: \"{user_input}\". "
+                        f"Complete ALL parts of the request. If they asked to read AND fix, do both. "
+                        f"If they ONLY asked to read, just present the result without fixing.]"
+            }
             self.conversation.append({
                 "role": "user",
-                "content": tool_results
+                "content": tool_results + [intent_reminder]
             })
 
         trace("loop exit: max_rounds reached", rounds=max_rounds)
         print("\n  ⚠️ Reached maximum rounds. Stopping.", flush=True)
+        traj.finish()
         return None
 
     def _generate(self, messages: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:

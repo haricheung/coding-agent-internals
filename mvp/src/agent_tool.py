@@ -93,7 +93,8 @@ class SubAgentRunner:
     """
 
     def __init__(self, server_url: str, working_dir: str,
-                 task_store: TaskStore, task_id: str = None):
+                 task_store: TaskStore, task_id: str = None,
+                 parent_session_id: str = None):
         """
         初始化子 Agent。
 
@@ -102,11 +103,13 @@ class SubAgentRunner:
             working_dir: 工作目录
             task_store: 共享的任务存储（用于更新任务状态）
             task_id: 关联的任务 ID（完成后自动更新状态）
+            parent_session_id: 父 Agent 的 session_id（用于轨迹关联）
         """
         self.server_url = server_url
         self.working_dir = working_dir
         self.task_store = task_store
         self.task_id = task_id
+        self.parent_session_id = parent_session_id
 
         # 子 Agent 的受限工具集：只有文件操作 + 命令执行
         # 没有 TaskCreate / TaskUpdate / TaskList / Agent
@@ -138,7 +141,8 @@ class SubAgentRunner:
             # skip_health_check=False（默认）：子 Agent 也会验证 server 连接
             sub_client = Client(
                 server_url=self.server_url,
-                working_dir=self.working_dir
+                working_dir=self.working_dir,
+                parent_session_id=self.parent_session_id
             )
 
             # ── 限制工具集 ────────────────────────────────────────────
@@ -150,7 +154,27 @@ class SubAgentRunner:
 
             # ── 执行任务 ──────────────────────────────────────────────
             sub_client.run(prompt)
-            self.result = f"Sub-agent completed task: {prompt[:80]}"
+
+            # ── 提取子 Agent 的最终回答 ────────────────────────────────
+            # sub_client.run() 返回 None，实际结果在对话历史中
+            # 从最后一条 assistant 消息提取文本作为结果返回给主 Agent
+            sub_response = ""
+            for msg in reversed(sub_client.conversation):
+                if msg.get("role") == "assistant":
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        sub_response = content
+                    elif isinstance(content, list):
+                        sub_response = "\n".join(
+                            b.get("text", "") for b in content
+                            if b.get("type") == "text"
+                        )
+                    break
+
+            # 捕获子 Agent 的 session_id 用于轨迹关联
+            self.sub_session_id = getattr(sub_client, '_traj_session_id', None)
+
+            self.result = sub_response or f"Sub-agent completed task: {prompt[:80]}"
 
             # ── 更新任务状态 ──────────────────────────────────────────
             if self.task_id:
@@ -245,7 +269,8 @@ class AgentTool(Tool):
         self._working_dir = working_dir
         self._store = store or task_store
 
-    def execute(self, prompt: str, task_id: str = None) -> str:
+    def execute(self, prompt: str, task_id: str = None,
+                parent_session_id: str = None) -> str:
         """
         生成子 Agent 并执行任务。
 
@@ -278,19 +303,20 @@ class AgentTool(Tool):
             server_url=self._server_url,
             working_dir=self._working_dir,
             task_store=self._store,
-            task_id=task_id
+            task_id=task_id,
+            parent_session_id=parent_session_id
         )
 
         result = runner.run(prompt)
 
-        # ── 返回结果摘要 ──────────────────────────────────────────────
+        # ── 返回结果 ──────────────────────────────────────────────────
+        # 附加 sub_session_id 用于轨迹关联（调用方可通过属性访问）
+        self._last_sub_session_id = getattr(runner, 'sub_session_id', None)
+
         if runner.error:
             return f"Sub-agent failed: {runner.error}"
 
-        if task_id:
-            return f"Sub-agent completed task #{task_id}: {prompt[:80]}"
-        else:
-            return f"Sub-agent completed: {prompt[:80]}"
+        return result
 
 
 # ===========================================================================

@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
 Main entry point for the Claude Code MVP
-Simple REPL interface for Day 1
+REPL with input history and CJK support (via prompt_toolkit)
 """
 
 import os
 import sys
 import argparse
 from client import Client
+
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import FileHistory
 
 
 def main():
@@ -33,13 +36,20 @@ def main():
         print(f"Error: {e}")
         sys.exit(1)
 
+    # History file: saved per working directory
+    history_dir = os.path.join(working_dir, ".agent")
+    os.makedirs(history_dir, exist_ok=True)
+    history_file = os.path.join(history_dir, "history")
+
+    session = PromptSession(history=FileHistory(history_file))
+
     print(f"\n=== Claude Code MVP ===")
     print(f"Working dir: {working_dir}")
     print("Type 'exit' to quit, 'reset' to clear conversation\n")
 
     while True:
         try:
-            user_input = input("🧑 You: ").strip()
+            user_input = session.prompt("🧑 You: ").strip()
 
             if not user_input:
                 continue
@@ -57,6 +67,9 @@ def main():
             print()  # newline after streamed response
 
         except KeyboardInterrupt:
+            print("\n👋 Goodbye!")
+            break
+        except EOFError:
             print("\n👋 Goodbye!")
             break
         except Exception as e:

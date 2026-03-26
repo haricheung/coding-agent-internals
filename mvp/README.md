@@ -157,6 +157,22 @@ python test_day1_features.py
 | 6.3 | *(follow-up)* `Now fix it` | 🔧 Uses Write tool to create fixed version (remembers which file) |
 | 6.4 | `reset` then `What bug were we looking at?` | 🔄 After reset, model has no memory — should say it doesn't know or explore files |
 
+### 7. Task Management
+
+| # | Prompt | Expected Result |
+|---|--------|----------------|
+| 7.1 | `Create three tasks: read buggy_code.py, find the bug, write a fix. Then execute them one by one.` | 🔧 TaskCreate × 3 → TaskUpdate("1", "in_progress") → Read → TaskUpdate("1", "completed") → ... chains through all three |
+| 7.2 | `What tasks do we have?` *(after 7.1)* | 🔧 TaskList → shows Markdown checklist with completed/pending status |
+| 7.3 | `Refactor buggy_code.py: extract the loop into a helper function, add type annotations, then verify it runs` | 🔧 TaskCreate to plan steps → executes each with TaskUpdate tracking → Bash to verify |
+
+### 8. Agent Team
+
+| # | Prompt | Expected Result |
+|---|--------|----------------|
+| 8.1 | `Spawn a sub-agent to read buggy_code.py and report what it does` | 🔧 Agent(prompt="read buggy_code.py and explain...") → sub-agent runs independently → returns summary |
+| 8.2 | `Create two tasks: analyze buggy_code.py for bugs, and list all files. Spawn a sub-agent for each.` | 🔧 TaskCreate × 2 → Agent(prompt=..., task_id="1") → Agent(prompt=..., task_id="2") → TaskList shows both completed |
+| 8.3 | `There are multiple Python files here. Review each one for bugs in parallel.` | 🔧 TaskCreate per file → Agent per task → sub-agents run with isolated contexts → main agent summarizes findings |
+
 ### Scorecard
 
 | Category | Tests | Key Pass Criteria |
@@ -167,12 +183,7 @@ python test_day1_features.py
 | Multi-Step | 4.1–4.2 | Chains multiple tools, end result is correct |
 | Edge Cases | 5.1–5.4 | Handles errors gracefully, proactive not passive |
 | Memory | 6.1–6.4 | Remembers context, reset clears it |
+| Task Management | 7.1–7.3 | Creates tasks, tracks progress, completes all |
+| Agent Team | 8.1–8.3 | Spawns sub-agents, isolated contexts, tasks auto-update |
 
-**Day 1 minimum pass: 2.1, 2.2, 5.3 all pass** (model can find and fix bugs proactively).
-
-## Next Steps (Day 2)
-
-- Add Edit tool for in-place modifications
-- Add Grep tool for code search
-- Implement bug repair workflow (Grep → Read → Edit → Bash)
-- Test on multiple bug types
+**Minimum pass: 2.1, 2.2, 5.3 all pass** (model can find and fix bugs proactively).

@@ -76,3 +76,42 @@ Response: {"tool": "Read", "parameters": {"file_path": "..."}}
 **Symptom:** Model does `find` → gets result → generates Read tool call → but Read never executes. The client stops after one tool round.
 **Root Cause:** `run()` had a fixed two-step flow: generate → execute tools → generate final response → done. If the second generation also contained tool calls, they were ignored.
 **Fix:** Changed `run()` to loop (up to 5 rounds): generate → if tool calls, execute and loop; if no tool calls, done. This supports multi-step workflows like find → read → analyze.
+
+## Issue 12: Write tool fails — model generates Python triple-quotes instead of JSON
+**Symptom:** When the model tries to write multi-line content, it outputs:
+```
+{"tool": "Write", "parameters": {"file_path": "...", "content": """
+line 1
+line 2
+"""}}
+```
+This is Python syntax, not valid JSON. `json.loads()` fails and the tool never executes.
+**Root Cause:** Small models (Qwen2.5-7B) conflate Python string syntax with JSON. They use `"""..."""` for multi-line strings instead of `"...\n..."`.
+**Fix:**
+1. **Parser**: Added `_sanitize_json()` that converts triple-quoted strings to proper JSON strings with `\n` before parsing. Also handles trailing commas and orphaned `</tool_call>` tags.
+2. **System prompt**: Added explicit JSON rules — "NEVER use triple-quotes", "use `\n` for newlines", plus a Write tool example showing the correct format.
+
+## Issue 13: Trace logs are noise, not signal — need structured trajectory
+**Symptom:** `[TRACE 1064.41s] parse_tool_calls | strategy=none | count=0` — these are internal debug stats, not a readable story of what the agent did. Impossible to review a session and understand what happened.
+**Root Cause:** `trajectory.py` only had `trace()` — a debug-level line logger. No structured session recording.
+**Fix:** Added `Trajectory` class to `trajectory.py`:
+1. Records structured rounds: Thought → Action → Result → Response
+2. Prints human-readable session log to terminal in real-time
+3. Saves full trajectory as JSON to `trajectories/session_YYYYMMDD_HHMMSS.json`
+4. Integrated into `client.py`'s `run()` loop — each round records thought, tool calls, and final response
+5. `trace()` kept for low-level debug (enabled with `--trace`), `Trajectory` always active
+
+## Issue 14: Model describes tool calls in text instead of invoking them
+**Symptom:** Model outputs "I'll use the Edit tool... Edit Request: File Path: ... Old String: ..." but `stop_reason=end_turn` with `tool_use_blocks=0`. The tool is never executed.
+**Root Cause:** Small models sometimes "play pretend" — they describe tool calls in natural language instead of emitting structured `<tool_call>` tokens. The adapter only recognizes `<tool_call>` format, so the tool call is lost.
+**Update (session_20260326_113517):** Happened again in Round 2-3. Model showed "corrected code" as markdown code block, ran the original file, got an error, then described another fix in text. File was never modified.
+**Status:** Open. Potential fixes:
+1. Adapter fallback: detect tool-like patterns in text output and convert to tool_use blocks
+2. One-shot re-prompt: if text mentions a tool name but stop_reason=end_turn, nudge: "Call the tool, don't describe it"
+3. Better system prompt: "NEVER describe a tool call. ALWAYS invoke it directly."
+
+## Issue 15: Agent over-acts — does more than asked
+**Symptom:** User says "Read buggy_code.py". Expected: read the file and show it. Actual: model reads the file, identifies the bug, attempts to fix it, runs `python3`, gets an error, tries another fix — all unprompted.
+**Root Cause:** System prompt is too aggressive: "ALWAYS use tools to act", "BUG FIX WORKFLOW (L-R-V pattern)" — this primes the model to jump straight to fixing even when user only asked to read.
+**Fix v1 (failed):** Added "CORE RULE — FOLLOW USER INTENT" to system prompt with examples ("Read X" → just read). Model ignored it — system prompt is too far from the generation point for a small model.
+**Fix v2 (structural):** Inject a user-intent reminder directly into the tool_result message: `[Reminder: user's original request was "Read buggy_code.py". Do exactly that, nothing more.]` This puts the instruction right next to the tool output where the model's attention is strongest. Also fixed adapter.py to pass text blocks alongside tool_results to the Qwen chat template.

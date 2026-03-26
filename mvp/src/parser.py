@@ -222,7 +222,30 @@ def parse_tool_calls(text: str) -> List[ToolCall]:
         orphan_pattern = r'(\{[^<]*?(?:"tool"|"name")[^<]*?\})\s*</tool_call>'
         matches = re.findall(orphan_pattern, text, re.DOTALL)
 
+    # 变体：Qwen3 格式的孤立闭标签（缺少 <tool_call> 开标签）
+    # 匹配 <function=ToolName>...</function></tool_call>
+    if not matches:
+        orphan_qwen3_pattern = r'(<function=\w+>.*?</function>)\s*</tool_call>'
+        matches = re.findall(orphan_qwen3_pattern, text, re.DOTALL)
+
+    # 变体：Qwen3 格式完全没有 <tool_call> 包裹
+    # 匹配独立的 <function=ToolName>...</function>
+    if not matches:
+        bare_qwen3_pattern = r'(<function=\w+>.*?</function>)'
+        matches = re.findall(bare_qwen3_pattern, text, re.DOTALL)
+
     for match in matches:
+        # Qwen3 format: <function=ToolName><parameter=key>value</parameter>...</function>
+        func_m = re.search(r'<function=(\w+)>', match)
+        if func_m:
+            fname = func_m.group(1)
+            params = {}
+            for pm in re.finditer(r'<parameter=(\w+)>\s*(.*?)\s*</parameter>', match, re.DOTALL):
+                params[pm.group(1)] = pm.group(2)
+            if fname:
+                tool_calls.append(ToolCall(fname, params))
+                continue
+        # Qwen2.5 format: JSON inside <tool_call> tags
         data = _try_parse_json(match)
         if data:
             tc = _extract_tool_call(data)
@@ -277,6 +300,41 @@ def parse_tool_calls(text: str) -> List[ToolCall]:
 
         if tool_calls:
             strategy_used = "bare_JSON"
+
+    # ── 策略四：函数调用语法 ToolName("arg") ──────────────────────
+    # 小模型有时输出 Python 函数调用风格而非 JSON：
+    #   Bash("rm /tmp/hello.py")
+    #   Read("/path/to/file.py")
+    # 需要将位置参数映射到工具的第一个必需参数名
+    if not tool_calls:
+        # 已知工具名 → 第一个参数名的映射
+        _primary_param = {
+            "Read": "file_path", "Write": "file_path", "Edit": "file_path",
+            "Grep": "pattern", "Bash": "command", "Agent": "prompt",
+            "TaskCreate": "subject", "TaskUpdate": "task_id", "TaskList": None,
+        }
+        # 匹配 ToolName("...") 或 ToolName({...})
+        func_pattern = r'\b(' + '|'.join(_primary_param.keys()) + r')\s*\(\s*(".*?"|\{.*?\})\s*\)'
+        for m in re.finditer(func_pattern, text, re.DOTALL):
+            fname, raw_arg = m.group(1), m.group(2)
+            param_name = _primary_param.get(fname)
+            if not param_name:
+                continue
+            # 尝试解析参数
+            if raw_arg.startswith('{'):
+                data = _try_parse_json(raw_arg)
+                if data and isinstance(data, dict):
+                    tool_calls.append(ToolCall(fname, data))
+            elif raw_arg.startswith('"'):
+                # 去引号，得到字符串值
+                try:
+                    arg_value = json.loads(raw_arg)
+                except json.JSONDecodeError:
+                    arg_value = raw_arg.strip('"')
+                tool_calls.append(ToolCall(fname, {param_name: arg_value}))
+
+        if tool_calls:
+            strategy_used = "func_call"
 
     # ── 轨迹日志 ─────────────────────────────────────────────────
     trace("parse_tool_calls",
