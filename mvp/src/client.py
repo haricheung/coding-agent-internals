@@ -28,6 +28,15 @@ ReAct 循环：
     stop_reason 决定是否继续循环：
     - "tool_use"：模型想调用工具 → 执行工具 → 回传结果 → 继续循环
     - "end_turn"：模型认为任务完成 → 退出循环 → 返回最终回答
+
+工具集演进（Day 1-4）：
+    Day 1: Read, Write, Bash                     — 基础文件操作
+    Day 2: + Edit, Grep                          — 精确编辑 + 代码搜索
+    Day 3: + TaskCreate, TaskUpdate, TaskList     — 任务管理
+    Day 4: + Agent                               — 子 Agent 生成
+
+    客户端通过 get_tools() 和 get_task_tools() 加载工具，
+    工具定义自动转为 Claude API 格式随请求发送。
 """
 
 import os
@@ -35,6 +44,8 @@ import json
 import requests
 from typing import List, Dict, Any, Optional
 from tools import get_tools
+from task_tools import get_task_tools, task_store
+from agent_tool import get_agent_tool
 
 
 # ---------------------------------------------------------------------------
@@ -88,28 +99,60 @@ class Client:
     - 每轮请求携带完整对话历史 + 工具定义发送给 model_server
     - model_server 返回结构化响应（content blocks），客户端直接处理
     - 客户端不做任何文本解析，所有格式转换在 model_server 适配层完成
+
+    工具集构成：
+    - 基础工具（tools.py）：Read, Write, Edit, Grep, Bash
+    - 任务工具（task_tools.py）：TaskCreate, TaskUpdate, TaskList
+    - Agent 工具（agent_tool.py）：Agent（子 Agent 生成）
+    所有工具通过统一的 self.tools 字典管理，execute 接口一致。
     """
 
     def __init__(self, server_url: str = "http://localhost:9981", working_dir: str = None):
         """
         初始化客户端。
 
+        初始化流程：
+        1. 加载所有工具（基础 + 任务 + Agent）
+        2. 生成 Claude 格式的工具定义
+        3. 扫描工作目录文件树
+        4. 健康检查（确认 model_server 可达）
+
         Args:
             server_url: model_server 的地址
             working_dir: 工作目录，Agent 将在此目录中操作文件
         """
         self.server_url = server_url.rstrip("/")
-        self.tools = get_tools(working_dir=working_dir)
-        self.tool_definitions = get_tool_definitions(self.tools)
-        self.conversation: List[Dict[str, Any]] = []
         self.working_dir = working_dir or os.getcwd()
 
-        # 扫描工作目录的文件树，嵌入 system prompt
-        # 这是 ACI 设计的一部分：给模型一个项目全景，帮助它定位文件
+        # ── 加载工具集 ────────────────────────────────────────────────
+        # 合并三类工具到统一字典：基础工具 + 任务工具 + Agent 工具
+        # 这使得 _execute_tool() 只需一次字典查找即可调用任何工具
+        self.tools: Dict[str, Any] = {}
+
+        # Day 1-2 基础工具：Read, Write, Edit, Grep, Bash
+        self.tools.update(get_tools(working_dir=self.working_dir))
+
+        # Day 3 任务管理工具：TaskCreate, TaskUpdate, TaskList
+        # 共享全局 task_store 实例，确保所有工具操作同一份任务数据
+        self.tools.update(get_task_tools(task_store))
+
+        # Day 4 Agent 工具：Agent（子 Agent 生成）
+        # 传入 server_url 和 working_dir，子 Agent 将复用同一个 model_server
+        self.tools.update(get_agent_tool(self.server_url, self.working_dir, task_store))
+
+        # 生成 Claude 格式的工具定义（随请求发送给 model_server）
+        self.tool_definitions = get_tool_definitions(self.tools)
+
+        # 对话历史：存储 Claude 格式的消息（含 content blocks）
+        self.conversation: List[Dict[str, Any]] = []
+
+        # ── 扫描文件树 ───────────────────────────────────────────────
+        # ACI 设计：给模型一个项目全景，帮助它定位文件
         # 50 行上限是信息粒度控制——防止大项目的文件树撑爆上下文
         self._file_tree = self._scan_files()
 
-        # 健康检查：确认 model_server 已启动
+        # ── 健康检查 ─────────────────────────────────────────────────
+        # 确认 model_server 已启动，否则后续所有请求都会失败
         try:
             resp = requests.get(f"{self.server_url}/health", timeout=3)
             resp.raise_for_status()
@@ -145,29 +188,52 @@ class Client:
         """
         生成系统提示词。
 
-        与 v1 的关键区别：
-        - 不再包含工具定义（工具定义通过 tools 参数传递，由 chat template 注入）
-        - 不再包含格式说明（模型使用其训练时的原生 <tool_call> 格式）
-        - 只保留行为指令：做什么（主动探索）、怎么做（先读后改）、不做什么（别猜路径）
+        系统提示词的设计哲学（ACI 行为引导层）：
+        - 不包含工具定义（由 chat template 的 tools 参数注入，与训练分布对齐）
+        - 不包含格式说明（模型使用其训练时的原生 <tool_call> 格式）
+        - 只包含行为指令：做什么、怎么做、不做什么
 
-        这使得 system prompt 更短、更聚焦，也更符合 SWE-agent 论文的 ACI 设计理念：
-        system prompt 负责行为引导，工具接口负责能力定义，两者分离。
+        v2 升级（Day 3-4 新增内容）：
+        - 新增任务管理指令：收到复合任务时，先分解再执行
+        - 新增 Edit 优先原则：修改已有文件优先用 Edit 而非 Write
+        - 新增 Grep 工作流：用 Grep 定位 → Read 精读 → Edit 修复
+        - 新增 Agent Team 指令：独立子任务可通过 Agent 工具并行执行
+
+        这使得 system prompt 既是行为指南，也是课程 ACI 设计的活教材。
         """
         return f"""You are a coding agent that helps users with software engineering tasks.
-You work inside a codebase and use tools to read, write, and execute code.
+You work inside a codebase and use tools to read, write, search, and execute code.
 
 Working directory: {self.working_dir}
 
 Files in this project:
 {self._file_tree}
 
-IMPORTANT RULES:
-1. ALWAYS use tools to act. Use Read to examine files, Write to create/modify them, Bash to run commands.
-2. NEVER ask the user to paste code or upload files. You can access the filesystem directly.
-3. Use the file tree above to locate files. Construct absolute paths as: {self.working_dir}/<relative_path>.
-4. If the user gives a partial filename like "buggy_code", match it to the closest file in the tree.
-5. When fixing bugs: first Read the file to understand the code, then Write the fix, then Bash to verify.
-6. Keep your text responses short and focused on what you found or did."""
+TOOL USAGE RULES:
+1. ALWAYS use tools to act. Never just describe what you would do — actually do it.
+2. NEVER ask the user to paste code or upload files. You have direct filesystem access.
+3. Use the file tree above to locate files. Absolute paths: {self.working_dir}/<relative_path>.
+4. If a filename is partial (e.g., "buggy_code"), match it to the closest file in the tree.
+
+BUG FIX WORKFLOW (L-R-V pattern):
+5. Localize: Use Grep to find relevant code, then Read to examine context.
+6. Repair: Use Edit (NOT Write) to make precise changes. Include enough context in old_string for uniqueness.
+7. Validate: Use Bash to run the code or tests to verify your fix works.
+
+EDITING RULES:
+8. PREFER Edit over Write for modifying existing files. Edit is safer (uniqueness check) and more efficient (sends only the diff).
+9. Only use Write for creating new files or complete rewrites.
+
+TASK MANAGEMENT (for complex, multi-step requests):
+10. When given a complex task with multiple sub-tasks, break it down:
+    - Use TaskCreate to create individual sub-tasks
+    - Use TaskUpdate to mark tasks as in_progress when starting, completed when done
+    - Use TaskList to review overall progress
+11. For independent sub-tasks that can run in parallel, use the Agent tool to spawn sub-agents.
+
+RESPONSE STYLE:
+12. Keep text responses short and focused on what you found or did.
+13. Show your reasoning briefly before taking action."""
 
     def run(self, user_input: str) -> Optional[str]:
         """
@@ -188,6 +254,11 @@ IMPORTANT RULES:
         当模型的 Orient 环节失灵（无法从重复的 Observation 中提取新信息）时，
         强制终止循环，避免无限消耗 token。
 
+        Day 3/4 升级：轮数从 5 提升到 10。
+        原因：引入任务管理后，一个复合任务可能需要：
+        TaskCreate × 3 + (Read + Edit + Bash) × 3 = 12 轮工具调用。
+        5 轮不够用了，10 轮是新的合理上限。
+
         Args:
             user_input: 用户的自然语言指令
 
@@ -197,9 +268,8 @@ IMPORTANT RULES:
         self.conversation.append({"role": "user", "content": user_input})
 
         # Circuit Breaker：最大循环轮数
-        # 5 轮足够覆盖 Read → 分析 → Write fix → Bash verify → 收尾
-        # 超过 5 轮通常意味着模型陷入了死循环
-        max_rounds = 5
+        # Day 3/4 升级：从 5 → 10，适应任务分解 + 多步执行的更长工作流
+        max_rounds = 10
         round_num = 0
 
         while round_num < max_rounds:
@@ -225,7 +295,6 @@ IMPORTANT RULES:
             # ── 检查是否需要执行工具 ──────────────────────────────
             if response.get("stop_reason") != "tool_use":
                 # 模型认为任务完成（stop_reason: "end_turn"）
-                # 打印最终文本响应
                 return None
 
             # ── 执行工具调用 ──────────────────────────────────────
@@ -324,8 +393,12 @@ IMPORTANT RULES:
         """
         执行单个工具调用。
 
+        统一的工具执行入口：根据 tool_name 从 self.tools 查找工具对象，
+        然后调用其 execute() 方法。所有工具（基础/任务/Agent）的执行接口一致。
+
         Args:
-            tool_name: 工具名（Read / Write / Bash）
+            tool_name: 工具名（Read / Write / Edit / Grep / Bash /
+                       TaskCreate / TaskUpdate / TaskList / Agent）
             parameters: 工具参数字典
 
         Returns:
@@ -341,5 +414,16 @@ IMPORTANT RULES:
             return f"Error executing {tool_name}: {str(e)}"
 
     def reset(self):
-        """重置对话历史，开始新的会话。"""
+        """
+        重置会话状态，开始新的对话。
+
+        清理内容：
+        1. 对话历史（conversation）：清空所有消息
+        2. 任务存储（task_store）：清空所有任务
+
+        为什么要同时清空任务？
+        任务是会话级状态——上一轮对话创建的任务对新对话没有意义。
+        如果不清空，模型可能会看到陈旧的任务列表，产生混乱。
+        """
         self.conversation = []
+        task_store.reset()
