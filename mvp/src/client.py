@@ -248,6 +248,13 @@ TASK MANAGEMENT (for complex, multi-step requests):
 - Use TaskCreate/TaskUpdate/TaskList to break down and track multi-step work.
 - For independent sub-tasks, use the Agent tool to spawn sub-agents.
 
+AGENT TEAM MODE (IMPORTANT):
+- When the user says "in parallel", "each one", "for each file", or requests multiple independent reviews/tasks, you MUST use the Agent tool to spawn one sub-agent per task.
+- Do NOT do the work yourself sequentially — spawn sub-agents instead.
+- Example: "Review each Python file for bugs in parallel" → spawn one Agent per .py file, each with prompt "Read <file> and report any bugs found."
+- Each sub-agent runs in its own context with Read/Write/Edit/Grep/Bash tools.
+- Wait for all sub-agents to complete, then summarize their findings.
+
 Keep text responses short. Always act first, explain after."""
 
     def run(self, user_input: str) -> Optional[str]:
