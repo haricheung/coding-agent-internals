@@ -140,9 +140,23 @@ class Client:
         # 共享全局 task_store 实例，确保所有工具操作同一份任务数据
         self.tools.update(get_task_tools(task_store))
 
+        # Day 4+ Team 通信工具（仅 Lead 加载完整工具集）
+        # 子 Agent 的 SendMessage 由 SubAgentRunner 注入，不在这里加载
+        self._message_queue = None
+        self._team_worker_name = None  # Worker 身份标识（由 SubAgentRunner 设置）
+        if parent_session_id is None:
+            # 顶层 Lead：创建消息队列，加载 TeamCreate + SendMessage + ReadInbox
+            from team_tools import MessageQueue, get_team_tools
+            self._message_queue = MessageQueue()
+            self.tools.update(get_team_tools(self._message_queue, agent_id="lead"))
+
         # Day 4 Agent 工具：Agent（子 Agent 生成）
         # 传入 server_url 和 working_dir，子 Agent 将复用同一个 model_server
-        self.tools.update(get_agent_tool(self.server_url, self.working_dir, task_store))
+        # 传入 message_queue，使子 Agent 在 Team 模式下能获得 SendMessage
+        self.tools.update(get_agent_tool(
+            self.server_url, self.working_dir, task_store,
+            message_queue=self._message_queue
+        ))
 
         # 生成 Claude 格式的工具定义（随请求发送给 model_server）
         self.tool_definitions = get_tool_definitions(self.tools)
@@ -208,6 +222,41 @@ class Client:
 
         这使得 system prompt 既是行为指南，也是课程 ACI 设计的活教材。
         """
+        # Worker 模式：精简的系统提示词 + team 通信指令
+        if self._team_worker_name:
+            return f"""You are a coding agent worker named '{self._team_worker_name}'. Complete the assigned task using your tools.
+
+Working directory: {self.working_dir}
+
+OUTPUT DIRECTORY (CRITICAL):
+- You MUST write ALL generated files to /tmp/team/workspace/
+- NEVER write files to the working directory above — it contains source code, not your output.
+- Create subdirectories under /tmp/team/workspace/ as needed.
+- Example: Write("/tmp/team/workspace/app.py", ...) or Write("/tmp/team/workspace/index.html", ...)
+
+Files in this project (READ-ONLY reference):
+{self._file_tree}
+
+RULES:
+1. Use tools for ALL file operations. NEVER guess file contents.
+2. Use absolute paths.
+3. PREFER Edit over Write for modifying existing files.
+
+EFFICIENCY (IMPORTANT):
+- Focus ONLY on the core deliverable. Do NOT create README, docs, requirements.txt, or other auxiliary files.
+- Do NOT spend rounds on redundant verification (e.g. grep for keywords you just wrote).
+- Budget: you have ~10 rounds total. Plan: 1-3 rounds to build, 1 round to verify, 1 round to SendMessage.
+
+TEAM COMMUNICATION (CRITICAL):
+- You are worker '{self._team_worker_name}' in a team led by 'lead'.
+- When you finish your task, call SendMessage(to="lead", content="<your results>") EXACTLY ONCE.
+- Include: what you did, file paths created/modified, any issues found.
+- Do NOT call SendMessage more than once — one clear report is enough.
+- Do NOT finish without calling SendMessage — the lead is waiting for your report.
+
+Keep responses short. Act first, explain after."""
+
+        # Lead 模式：完整的系统提示词
         return f"""You are a coding agent. You MUST use tools for ALL file operations. You can NEVER output file contents from memory — you MUST call Read to see any file.
 
 Working directory: {self.working_dir}
@@ -254,6 +303,14 @@ AGENT TEAM MODE (IMPORTANT):
 - Example: "Review each Python file for bugs in parallel" → spawn one Agent per .py file, each with prompt "Read <file> and report any bugs found."
 - Each sub-agent runs in its own context with Read/Write/Edit/Grep/Bash tools.
 - Wait for all sub-agents to complete, then summarize their findings.
+
+TEAM COMMUNICATION:
+- To set up a team: call TeamCreate(members=["backend-dev", "frontend-dev", "test-dev"]).
+- To spawn a named worker: call Agent(prompt="...", agent_name="backend-dev"). The worker gets a SendMessage tool.
+- Workers will SendMessage their results to your inbox before they return.
+- After workers complete, call ReadInbox() to read all their messages at once.
+- Workers write output files to /tmp/team/workspace/ (not the working directory).
+- Workflow: TeamCreate → Agent(worker1) → Agent(worker2) → ReadInbox → review results → Agent(worker3) → ReadInbox → final summary.
 
 Keep text responses short. Always act first, explain after."""
 
@@ -453,9 +510,21 @@ Keep text responses short. Always act first, explain after."""
                         f"Complete ALL parts of the request. If they asked to read AND fix, do both. "
                         f"If they ONLY asked to read, just present the result without fixing.]"
             }
+
+            # ── Last-round nudge ──────────────────────────────────
+            # Worker 快到轮次上限时，注入紧急提醒让它调 SendMessage。
+            # 这比纯靠 system prompt 有效——距离近、时机准、模型注意力集中。
+            # 三层防线的中间层：prompt 预防 → nudge 催促 → auto-send 兜底。
+            extras = []
+            if self._team_worker_name and round_num == max_rounds - 1:
+                extras.append({
+                    "type": "text",
+                    "text": f"[URGENT: You have 1 round left. You MUST call SendMessage(to=\"lead\") NOW to report your results. Do NOT call any other tool.]"
+                })
+
             self.conversation.append({
                 "role": "user",
-                "content": tool_results + [intent_reminder]
+                "content": tool_results + [intent_reminder] + extras
             })
 
         trace("loop exit: max_rounds reached", rounds=max_rounds)
@@ -545,6 +614,7 @@ Keep text responses short. Always act first, explain after."""
         清理内容：
         1. 对话历史（conversation）：清空所有消息
         2. 任务存储（task_store）：清空所有任务
+        3. 消息队列（message_queue）：清理 /tmp/team/ 目录
 
         为什么要同时清空任务？
         任务是会话级状态——上一轮对话创建的任务对新对话没有意义。
@@ -552,3 +622,5 @@ Keep text responses short. Always act first, explain after."""
         """
         self.conversation = []
         task_store.reset()
+        if self._message_queue:
+            self._message_queue.cleanup()

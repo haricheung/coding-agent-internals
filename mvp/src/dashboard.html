@@ -168,6 +168,7 @@ async function fetchJSON(url) { return (await fetch(API+url)).json(); }
 const TOOL_COLORS = {
   Read:'#58a6ff', Write:'#3fb950', Edit:'#d29922', Grep:'#bc8cff',
   Bash:'#f0883e', Agent:'#f778ba', TaskCreate:'#8b949e', TaskUpdate:'#8b949e', TaskList:'#8b949e',
+  SendMessage:'#39d353', ReadInbox:'#39d353', TeamCreate:'#da3633',
 };
 
 function escHtml(s) { const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }

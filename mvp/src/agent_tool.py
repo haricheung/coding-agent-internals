@@ -94,7 +94,8 @@ class SubAgentRunner:
 
     def __init__(self, server_url: str, working_dir: str,
                  task_store: TaskStore, task_id: str = None,
-                 parent_session_id: str = None):
+                 parent_session_id: str = None,
+                 message_queue=None, agent_name: str = None):
         """
         初始化子 Agent。
 
@@ -104,12 +105,16 @@ class SubAgentRunner:
             task_store: 共享的任务存储（用于更新任务状态）
             task_id: 关联的任务 ID（完成后自动更新状态）
             parent_session_id: 父 Agent 的 session_id（用于轨迹关联）
+            message_queue: Team 模式消息队列（传递给 Worker 的 SendMessage）
+            agent_name: Worker 名称（Team 模式下的身份标识）
         """
         self.server_url = server_url
         self.working_dir = working_dir
         self.task_store = task_store
         self.task_id = task_id
         self.parent_session_id = parent_session_id
+        self.message_queue = message_queue
+        self.agent_name = agent_name
 
         # 子 Agent 的受限工具集：只有文件操作 + 命令执行
         # 没有 TaskCreate / TaskUpdate / TaskList / Agent
@@ -152,6 +157,16 @@ class SubAgentRunner:
             from client import get_tool_definitions
             sub_client.tool_definitions = get_tool_definitions(self.tools)
 
+            # ── Team 模式：注入 SendMessage 工具 ─────────────────────
+            # Worker 需要 SendMessage 来向 Lead 报告结果
+            if self.message_queue and self.agent_name:
+                from team_tools import SendMessageTool
+                send_tool = SendMessageTool(self.message_queue, self.agent_name)
+                sub_client.tools["SendMessage"] = send_tool
+                sub_client.tool_definitions = get_tool_definitions(sub_client.tools)
+                # 标记 worker 身份，让 system prompt 注入 team 通信指令
+                sub_client._team_worker_name = self.agent_name
+
             # ── 执行任务 ──────────────────────────────────────────────
             sub_client.run(prompt)
 
@@ -170,6 +185,26 @@ class SubAgentRunner:
                             if b.get("type") == "text"
                         )
                     break
+
+            # ── Harness 兜底：Worker 未调 SendMessage 时自动补发 ──────
+            # 小模型经常忘记调 SendMessage 就 end_turn 了。
+            # Harness 层检测：如果整个对话历史中没有 SendMessage 调用，
+            # 则自动把 Worker 的最终回答发给 Lead。
+            # 这是"harness 约束"的典型体现——不靠模型自觉，靠代码兜底。
+            if self.message_queue and self.agent_name:
+                worker_sent_message = any(
+                    block.get("name") == "SendMessage"
+                    for msg in sub_client.conversation
+                    if msg.get("role") == "assistant"
+                    for block in (msg.get("content", []) if isinstance(msg.get("content"), list) else [])
+                    if block.get("type") == "tool_use"
+                )
+                if not worker_sent_message and sub_response:
+                    # 自动补发
+                    auto_content = f"[Auto-report] {sub_response[:800]}"
+                    self.message_queue.send(self.agent_name, "lead", auto_content)
+                    print(f"  📨 Harness auto-sent report from '{self.agent_name}' to 'lead'",
+                          flush=True)
 
             # 捕获子 Agent 的 session_id 用于轨迹关联
             self.sub_session_id = getattr(sub_client, '_traj_session_id', None)
@@ -224,7 +259,7 @@ class AgentTool(Tool):
     """
 
     def __init__(self, server_url: str, working_dir: str,
-                 store: TaskStore = None):
+                 store: TaskStore = None, message_queue=None):
         """
         初始化 Agent 工具。
 
@@ -232,6 +267,7 @@ class AgentTool(Tool):
             server_url: model_server 地址
             working_dir: 工作目录
             store: 任务存储实例（共享）
+            message_queue: Team 模式消息队列（传递给子 Agent）
         """
         super().__init__(
             name="Agent",
@@ -239,8 +275,8 @@ class AgentTool(Tool):
                 "Spawn a sub-agent to execute a task in an isolated context. "
                 "The sub-agent has its own conversation history and limited "
                 "tools (Read, Write, Edit, Grep, Bash). It cannot create tasks "
-                "or spawn other agents. Optionally link to a task_id to "
-                "auto-update task status on completion."
+                "or spawn other agents. Use agent_name in team mode to give "
+                "the worker a name and SendMessage capability."
             ),
             parameters={
                 "type": "object",
@@ -260,6 +296,14 @@ class AgentTool(Tool):
                             "When the sub-agent completes, the task will be "
                             "automatically marked as 'completed'."
                         )
+                    },
+                    "agent_name": {
+                        "type": "string",
+                        "description": (
+                            "Worker name for team mode (e.g. 'backend-dev'). "
+                            "Named workers get SendMessage tool to report results "
+                            "back to the lead. Must match a name from TeamCreate."
+                        )
                     }
                 },
                 "required": ["prompt"]
@@ -268,21 +312,25 @@ class AgentTool(Tool):
         self._server_url = server_url
         self._working_dir = working_dir
         self._store = store or task_store
+        self._message_queue = message_queue
 
     def execute(self, prompt: str, task_id: str = None,
-                parent_session_id: str = None) -> str:
+                parent_session_id: str = None,
+                agent_name: str = None) -> str:
         """
         生成子 Agent 并执行任务。
 
         执行流程：
         1. 如果有 task_id，先将任务标记为 in_progress
-        2. 创建 SubAgentRunner
+        2. 创建 SubAgentRunner（传递 team context）
         3. 执行子 Agent 的 ReAct 循环
         4. 返回执行结果摘要
 
         Args:
             prompt: 子 Agent 的任务指令
             task_id: 可选的关联任务 ID
+            parent_session_id: 父 Agent session ID（由 client.py 注入）
+            agent_name: Worker 名称（Team 模式）
 
         Returns:
             执行结果摘要
@@ -296,7 +344,8 @@ class AgentTool(Tool):
             print(f"\n  🤖 Spawning sub-agent for task #{task_id}: {prompt[:60]}...",
                   flush=True)
         else:
-            print(f"\n  🤖 Spawning sub-agent: {prompt[:60]}...", flush=True)
+            label = f" [{agent_name}]" if agent_name else ""
+            print(f"\n  🤖 Spawning sub-agent{label}: {prompt[:60]}...", flush=True)
 
         # ── 创建并执行子 Agent ────────────────────────────────────────
         runner = SubAgentRunner(
@@ -304,7 +353,9 @@ class AgentTool(Tool):
             working_dir=self._working_dir,
             task_store=self._store,
             task_id=task_id,
-            parent_session_id=parent_session_id
+            parent_session_id=parent_session_id,
+            message_queue=self._message_queue,
+            agent_name=agent_name
         )
 
         result = runner.run(prompt)
@@ -324,7 +375,8 @@ class AgentTool(Tool):
 # ===========================================================================
 
 def get_agent_tool(server_url: str, working_dir: str,
-                   store: TaskStore = None) -> Dict[str, Tool]:
+                   store: TaskStore = None,
+                   message_queue=None) -> Dict[str, Tool]:
     """
     返回 Agent 工具字典。
 
@@ -332,10 +384,11 @@ def get_agent_tool(server_url: str, working_dir: str,
         server_url: model_server 地址
         working_dir: 工作目录
         store: 任务存储实例
+        message_queue: Team 模式消息队列（传递给子 Agent）
 
     Returns:
         {工具名: 工具对象} 字典
     """
     return {
-        "Agent": AgentTool(server_url, working_dir, store),
+        "Agent": AgentTool(server_url, working_dir, store, message_queue),
     }
