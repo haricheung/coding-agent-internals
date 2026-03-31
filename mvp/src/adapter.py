@@ -209,6 +209,91 @@ def claude_messages_to_qwen(messages: List[Dict[str, Any]]) -> List[Dict[str, An
     return qwen_messages
 
 
+def claude_messages_to_openai(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    将 Claude 格式的对话消息转换为 OpenAI API 格式。
+
+    与 claude_messages_to_qwen() 的核心差异：
+    - OpenAI tool_calls 需要 id 和 type 字段（Qwen chat template 不需要）
+    - OpenAI tool_calls 的 arguments 是 JSON 字符串，不是对象
+    - OpenAI tool 消息需要 tool_call_id 字段关联工具调用
+
+    用于 vLLM serve 的 OpenAI 兼容 API（/v1/chat/completions）。
+    """
+    openai_messages = []
+
+    for msg in messages:
+        role = msg["role"]
+        content = msg["content"]
+
+        # 纯文本消息
+        if isinstance(content, str):
+            openai_messages.append({"role": role, "content": content})
+            continue
+
+        if isinstance(content, list):
+            text_parts = []
+            tool_uses = []
+            tool_results = []
+
+            for block in content:
+                block_type = block.get("type", "")
+                if block_type == "text":
+                    text_parts.append(block["text"])
+                elif block_type == "tool_use":
+                    tool_uses.append(block)
+                elif block_type == "tool_result":
+                    tool_results.append(block)
+
+            # assistant + tool_use → OpenAI assistant with tool_calls
+            if role == "assistant" and tool_uses:
+                assistant_msg = {
+                    "role": "assistant",
+                    "content": "\n".join(text_parts) if text_parts else None,
+                    "tool_calls": []
+                }
+                for tu in tool_uses:
+                    args = tu["input"]
+                    if isinstance(args, dict):
+                        args = json.dumps(args, ensure_ascii=False)
+                    assistant_msg["tool_calls"].append({
+                        "id": tu["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tu["name"],
+                            "arguments": args
+                        }
+                    })
+                openai_messages.append(assistant_msg)
+
+            # tool_result → OpenAI tool messages (each with tool_call_id)
+            elif tool_results:
+                for tr in tool_results:
+                    result_content = tr.get("content", "")
+                    if isinstance(result_content, list):
+                        result_content = "\n".join(
+                            item.get("text", str(item))
+                            for item in result_content
+                        )
+                    openai_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tr.get("tool_use_id", ""),
+                        "content": result_content
+                    })
+                if text_parts:
+                    openai_messages.append({
+                        "role": "user",
+                        "content": "\n".join(text_parts)
+                    })
+
+            # 纯文本 blocks
+            else:
+                combined_text = "\n".join(text_parts)
+                openai_messages.append({"role": role, "content": combined_text})
+
+    return openai_messages
+
+
 # ---------------------------------------------------------------------------
 # 出口转换：Qwen → Claude
 # ---------------------------------------------------------------------------

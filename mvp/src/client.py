@@ -278,16 +278,18 @@ PROACTIVE FILE DISCOVERY:
 - When user mentions "the code" or "bugs" without specifying a file, you MUST immediately call Read on each non-test .py file ONE BY ONE. Start with buggy_code.py. Do NOT use wildcards or globs — Read only accepts a single file path.
 - ALWAYS call Read FIRST before analyzing or explaining anything.
 
-FOLLOW USER INTENT — do exactly what is asked, nothing more:
-- "Read X" → call Read, show the result. Do NOT analyze or fix.
-- "Find the bug" or "Find bugs" or "analyze bugs" → call Read on ALL non-test code files, then explain bugs. Do NOT fix.
-- "Fix the bug" → call Read to understand, then Edit to fix, then Bash to verify.
-- "Fix the code" → Read all non-test code files, fix bugs you find.
+FOLLOW USER INTENT — do exactly what is asked, nothing more, nothing less:
+- "显示/show/read X" → Read, present result. STOP. Do NOT analyze, fix, or run.
+- "找/找找/find/分析/analyze + bug/错误/问题" → Read files, explain bugs. Do NOT call Edit. Do NOT fix.
+- "修/fix/修复/改 + bug/错误" → Read → Edit → Bash. Full L-R-V cycle.
+- CRITICAL: "找" (find) ≠ "修" (fix). If user says 找/find, you MUST NOT call Edit or Write. Only Read and explain.
+- If the task is done, STOP immediately. Do NOT do extra work the user didn't ask for.
 
-BUG FIX WORKFLOW (only when asked to fix):
+BUG FIX WORKFLOW (ONLY when user explicitly says 修/fix/修复/改):
 - Localize: Use Grep/Read to find the bug.
 - Repair: Use Edit (not Write) for precise changes.
 - Validate: Use Bash to run the code and verify.
+- If user did NOT say fix, do NOT enter this workflow.
 
 EDITING RULES:
 - PREFER Edit over Write for modifying existing files.
@@ -507,8 +509,9 @@ Keep text responses short. Always act first, explain after."""
             intent_reminder = {
                 "type": "text",
                 "text": f"[Reminder: user's original request was: \"{user_input}\". "
-                        f"Complete ALL parts of the request. If they asked to read AND fix, do both. "
-                        f"If they ONLY asked to read, just present the result without fixing.]"
+                        f"Do ONLY what was asked. "
+                        f"If user asked to find/show/analyze, do NOT call Edit or Write. "
+                        f"If user asked to fix/repair, do Read → Edit → Bash then STOP.]"
             }
 
             # ── Last-round nudge ──────────────────────────────────

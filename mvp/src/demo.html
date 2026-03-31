@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Demo 1: Chat vs Agent</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, 'Segoe UI', 'PingFang SC', sans-serif; background: #0d1117; color: #e6edf3; height: 100vh; display: flex; flex-direction: column; }
+/* Header */
+.header { display: flex; align-items: center; justify-content: space-between; padding: 12px 24px; background: #161b22; border-bottom: 1px solid #30363d; }
+.header h1 { font-size: 18px; font-weight: 600; }
+.header-right { display: flex; gap: 12px; align-items: center; }
+.header-right label { font-size: 13px; color: #8b949e; }
+.header-right select { background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 4px 8px; font-size: 13px; }
+/* Main split */
+.main { flex: 1; display: flex; overflow: hidden; }
+.panel { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.panel:first-child { border-right: 2px solid #30363d; }
+.panel-header { padding: 12px 20px; background: #161b22; border-bottom: 1px solid #30363d; display: flex; align-items: center; gap: 10px; }
+.panel-header .badge { font-size: 11px; padding: 2px 8px; border-radius: 10px; font-weight: 600; text-transform: uppercase; }
+.badge-chat { background: #da3633; color: #fff; }
+.badge-agent { background: #238636; color: #fff; }
+.panel-header .title { font-size: 15px; font-weight: 600; }
+.panel-header .subtitle { font-size: 12px; color: #8b949e; }
+.panel-body { flex: 1; overflow-y: auto; padding: 16px 20px; }
+/* Messages */
+.msg { margin-bottom: 16px; animation: fadeIn 0.3s; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+.msg-role { font-size: 12px; font-weight: 600; margin-bottom: 4px; }
+.msg-role.thought { color: #d2a8ff; }
+.msg-role.tool { color: #79c0ff; }
+.msg-role.result { color: #56d364; }
+.msg-role.error { color: #f85149; }
+.msg-role.final { color: #e6edf3; }
+.msg-role.chat-response { color: #ffa657; }
+.msg-content { font-size: 14px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 12px 16px; }
+.msg-content code { background: #21262d; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+.tool-badge { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 4px; font-weight: 600; margin-left: 6px; }
+.tool-Read { background: #1f6feb33; color: #79c0ff; }
+.tool-Edit { background: #da363333; color: #ff7b72; }
+.tool-Write { background: #da363333; color: #ff7b72; }
+.tool-Grep { background: #8957e533; color: #d2a8ff; }
+.tool-Bash { background: #23863633; color: #56d364; }
+.round-divider { text-align: center; margin: 12px 0; font-size: 11px; color: #484f58; border-top: 1px dashed #21262d; padding-top: 8px; }
+/* Timing */
+.timing { font-size: 11px; color: #484f58; margin-top: 4px; text-align: right; }
+/* Input bar */
+.input-bar { display: flex; padding: 12px 24px; background: #161b22; border-top: 1px solid #30363d; gap: 10px; }
+.input-bar input { flex: 1; background: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: 10px 16px; color: #e6edf3; font-size: 14px; outline: none; }
+.input-bar input:focus { border-color: #1f6feb; }
+.input-bar input::placeholder { color: #484f58; }
+.input-bar button { background: #238636; color: #fff; border: none; border-radius: 8px; padding: 10px 24px; font-size: 14px; font-weight: 600; cursor: pointer; transition: background 0.15s; }
+.input-bar button:hover { background: #2ea043; }
+.input-bar button:disabled { background: #21262d; color: #484f58; cursor: not-allowed; }
+.input-bar .btn-clear { background: #21262d; color: #8b949e; }
+.input-bar .btn-clear:hover { background: #30363d; }
+/* Status */
+.status { display: flex; align-items: center; gap: 6px; padding: 6px 20px; font-size: 12px; color: #8b949e; min-height: 28px; }
+.status .spinner { width: 12px; height: 12px; border: 2px solid #30363d; border-top-color: #58a6ff; border-radius: 50%; animation: spin 0.8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Demo 1: Chat vs Agent</h1>
+  <div class="header-right">
+    <label>Model:</label>
+    <select id="modelSelect" onchange="onModelSwitch()">
+    </select>
+    <button onclick="editModels()" style="background:#21262d;color:#8b949e;border:1px solid #30363d;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer;">Edit</button>
+    <label>Working Dir:</label>
+    <select id="workingDir">
+      <option value="">tests/ (default)</option>
+    </select>
+  </div>
+</div>
+
+<div class="main">
+  <!-- Chat Panel -->
+  <div class="panel">
+    <div class="panel-header">
+      <span class="badge badge-chat">Chat</span>
+      <span class="title">Chat Mode</span>
+      <span class="subtitle">Open-loop: no tools, single response</span>
+    </div>
+    <div class="status" id="chatStatus"></div>
+    <div class="panel-body" id="chatBody"></div>
+  </div>
+  <!-- Agent Panel -->
+  <div class="panel">
+    <div class="panel-header">
+      <span class="badge badge-agent">Agent</span>
+      <span class="title">Agent Mode</span>
+      <span class="subtitle">Closed-loop: ReAct cycle with tools</span>
+    </div>
+    <div class="status" id="agentStatus"></div>
+    <div class="panel-body" id="agentBody"></div>
+  </div>
+</div>
+
+<div class="input-bar">
+  <input id="promptInput" placeholder="Enter a prompt, e.g.: tests/buggy_code.py has a bug, please fix it" autofocus>
+  <button id="sendBtn" onclick="sendPrompt()">Send</button>
+  <button class="btn-clear" onclick="clearAll()">Clear</button>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let chatRunning = false, agentRunning = false;
+
+// ── Model registry: each "model" is a separate server instance ──
+const STORAGE_KEY = 'demo_models';
+
+function defaultModels() {
+  // Use the current page's origin as the first model entry
+  const origin = location.origin;  // e.g. http://localhost:9981
+  return [{ name: 'default', url: origin }];
+}
+
+function loadModelRegistry() {
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (saved) {
+      const models = JSON.parse(saved);
+      if (models.length > 0) return models;
+    }
+  } catch(e) {}
+  return defaultModels();
+}
+
+function saveModelRegistry(models) {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(models));
+}
+
+function renderModelSelect() {
+  const models = loadModelRegistry();
+  const sel = $('modelSelect');
+  sel.innerHTML = '';
+  for (const m of models) {
+    const opt = document.createElement('option');
+    opt.value = m.url;
+    opt.textContent = m.name;
+    sel.appendChild(opt);
+  }
+}
+
+function serverUrl() {
+  return $('modelSelect').value.replace(/\/+$/, '');
+}
+
+function currentModelName() {
+  return $('modelSelect').selectedOptions[0]?.textContent || '';
+}
+
+function onModelSwitch() {
+  const name = currentModelName();
+  setStatus('chat', `Model: ${name}`);
+  setStatus('agent', `Model: ${name}`);
+}
+
+function editModels() {
+  const models = loadModelRegistry();
+  const text = models.map(m => `${m.name}=${m.url}`).join('\n');
+  const input = prompt(
+    'Edit models (one per line, format: name=url)\n\nExample:\nQwen3-8B=http://localhost:9981\nQwen3-30B=http://localhost:9982',
+    text
+  );
+  if (input === null) return;
+  const parsed = input.trim().split('\n').map(line => {
+    const [name, ...rest] = line.split('=');
+    return { name: name.trim(), url: rest.join('=').trim() };
+  }).filter(m => m.name && m.url);
+  if (parsed.length === 0) return;
+  saveModelRegistry(parsed);
+  renderModelSelect();
+}
+
+function addMsg(panel, role, content, extra = '') {
+  const body = $(panel + 'Body');
+  const div = document.createElement('div');
+  div.className = 'msg';
+  div.innerHTML = `<div class="msg-role ${role}">${extra}</div><div class="msg-content">${escapeHtml(content)}</div>`;
+  body.appendChild(div);
+  body.scrollTop = body.scrollHeight;
+  return div;
+}
+
+function addDivider(panel, text) {
+  const body = $(panel + 'Body');
+  const div = document.createElement('div');
+  div.className = 'round-divider';
+  div.textContent = text;
+  body.appendChild(div);
+}
+
+function setStatus(panel, text, spinning = false) {
+  const el = $(panel + 'Status');
+  el.innerHTML = spinning ? `<div class="spinner"></div> ${text}` : text;
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function sendPrompt() {
+  const prompt = $('promptInput').value.trim();
+  if (!prompt) return;
+  $('sendBtn').disabled = true;
+
+  const modelName = currentModelName();
+  addMsg('chat', 'msg-role', prompt, `User [${modelName}]`);
+  addMsg('agent', 'msg-role', prompt, `User [${modelName}]`);
+
+  runChat(prompt);
+  runAgent(prompt);
+}
+
+async function runChat(prompt) {
+  chatRunning = true;
+  setStatus('chat', `Generating... [${currentModelName()}]`, true);
+  const t0 = performance.now();
+
+  try {
+    const resp = await fetch(serverUrl() + '/api/demo/chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ prompt })
+    });
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let fullText = '';
+    let responseObj = null;
+
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, {stream: true});
+      for (const line of chunk.split('\n')) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+          const data = JSON.parse(line.slice(6));
+          if (data.token) fullText += data.token;
+          if (data.done && data.response) responseObj = data.response;
+        } catch(e) {}
+      }
+    }
+
+    let text = fullText;
+    if (responseObj && responseObj.content) {
+      text = responseObj.content
+        .filter(b => b.type === 'text')
+        .map(b => b.text)
+        .join('\n');
+    }
+
+    const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+    addMsg('chat', 'chat-response', text || '(no response)', 'Assistant');
+    setStatus('chat', `${currentModelName()} | ${elapsed}s | 0 tool calls | 0 rounds`);
+  } catch(e) {
+    addMsg('chat', 'error', e.message, 'Error');
+    setStatus('chat', 'Error');
+  }
+  chatRunning = false;
+  checkDone();
+}
+
+async function runAgent(prompt) {
+  agentRunning = true;
+  setStatus('agent', `Starting ReAct loop... [${currentModelName()}]`, true);
+  const t0 = performance.now();
+  let currentRound = 0;
+  let toolCalls = 0;
+
+  try {
+    const resp = await fetch(serverUrl() + '/api/demo/agent', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ prompt, working_dir: $('workingDir').value })
+    });
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, {stream: true});
+
+      while (buffer.includes('\n')) {
+        const idx = buffer.indexOf('\n');
+        const line = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 1);
+
+        if (!line.startsWith('data: ')) continue;
+        try {
+          const event = JSON.parse(line.slice(6));
+          handleAgentEvent(event, t0);
+          if (event.round && event.round > currentRound) {
+            currentRound = event.round;
+            addDivider('agent', `Round ${currentRound}`);
+          }
+          if (event.type === 'tool_result') toolCalls++;
+          setStatus('agent', `${currentModelName()} | Round ${currentRound} | ${toolCalls} tool calls...`, true);
+          if (event.type === 'done' || event.type === 'error' || event.type === 'final' || event.type === 'max_rounds') {
+            const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+            setStatus('agent', `${currentModelName()} | ${elapsed}s | ${toolCalls} tool calls | ${currentRound} rounds`);
+          }
+        } catch(e) {}
+      }
+    }
+  } catch(e) {
+    addMsg('agent', 'error', e.message, 'Error');
+    setStatus('agent', 'Error');
+  }
+  agentRunning = false;
+  checkDone();
+}
+
+function handleAgentEvent(event, t0) {
+  switch (event.type) {
+    case 'thought':
+      let label = `Round ${event.round} Thought`;
+      if (event.tool) {
+        label += ` <span class="tool-badge tool-${event.tool}">${event.tool}</span>`;
+      }
+      if (event.content) {
+        addMsg('agent', 'thought', event.content, label);
+      }
+      if (event.tool) {
+        const inputStr = typeof event.tool_input === 'object' ? JSON.stringify(event.tool_input, null, 2) : String(event.tool_input);
+        addMsg('agent', 'tool', inputStr, `Action: ${event.tool}()`);
+      }
+      break;
+    case 'tool_result':
+      addMsg('agent', event.is_error ? 'error' : 'result',
+        event.result,
+        `${event.is_error ? 'Error' : 'Observation'} (${event.tool})`);
+      break;
+    case 'final':
+      addMsg('agent', 'final', event.content || '(task complete)', 'Final Answer');
+      break;
+    case 'max_rounds':
+      addMsg('agent', 'error', `Reached maximum ${event.rounds} rounds. Stopping.`, 'Circuit Breaker');
+      break;
+    case 'error':
+      addMsg('agent', 'error', event.content, 'Error');
+      break;
+    case 'done':
+      break;
+  }
+}
+
+function checkDone() {
+  if (!chatRunning && !agentRunning) {
+    $('sendBtn').disabled = false;
+  }
+}
+
+function clearAll() {
+  $('chatBody').innerHTML = '';
+  $('agentBody').innerHTML = '';
+  setStatus('chat', '');
+  setStatus('agent', '');
+}
+
+$('promptInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !$('sendBtn').disabled) sendPrompt();
+});
+
+// Init
+renderModelSelect();
+</script>
+</body>
+</html>
