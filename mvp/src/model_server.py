@@ -585,8 +585,13 @@ async def demo_agent(req: DemoRequest):
 
                     conversation.append(response)
 
+                    # 【学自 CC 源码】检查 tool_use block 的实际存在性
+                    tool_use_blocks = [b for b in response.get("content", [])
+                                       if b.get("type") == "tool_use"]
+                    has_tool_calls = len(tool_use_blocks) > 0
+
                     # 非 tool_use 响应
-                    if response.get("stop_reason") != "tool_use":
+                    if not has_tool_calls:
                         # Nudge 机制（与 client.py Issue 14 一致）
                         full_text = " ".join(thought_parts)
                         check_tools = [t for t in tools.keys()
@@ -625,11 +630,9 @@ async def demo_agent(req: DemoRequest):
                                "content": thought_text})
                         break
 
-                    # 执行工具调用
+                    # 执行工具调用（使用上面提取的 tool_use_blocks）
                     tool_results = []
-                    for block in response.get("content", []):
-                        if block.get("type") != "tool_use":
-                            continue
+                    for block in tool_use_blocks:
                         tool_name = block["name"]
                         tool_input_data = block["input"]
                         tool_use_id = block["id"]

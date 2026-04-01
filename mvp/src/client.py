@@ -25,9 +25,11 @@ ReAct 循环：
     - Action：模型请求调用工具（tool_use content block）
     - Observation：工具执行结果（tool_result content block）
 
-    stop_reason 决定是否继续循环：
-    - "tool_use"：模型想调用工具 → 执行工具 → 回传结果 → 继续循环
-    - "end_turn"：模型认为任务完成 → 退出循环 → 返回最终回答
+    stop_reason 与 tool_use block 检测（学自 CC 源码）：
+    - 主判断：检查 response content 中是否存在 tool_use block（CC 做法）
+    - 辅助参考：stop_reason 字段（CC 源码注释: "stop_reason is unreliable"）
+    - 存在 tool_use block → 执行工具 → 回传结果 → 继续循环
+    - 不存在 tool_use block → 模型认为任务完成 → 退出循环
 
 工具集演进（Day 1-4）：
     Day 1: Read, Write, Bash                     — 基础文件操作
@@ -405,7 +407,15 @@ Keep text responses short. Always act first, explain after."""
             self.conversation.append(response)
 
             # ── 检查是否需要执行工具 ──────────────────────────────
-            if response.get("stop_reason") != "tool_use":
+            # 【学自 CC 源码】CC 的 query.ts 不信任 stop_reason（注释: "stop_reason
+            # === 'tool_use' is unreliable"），而是直接检查 response 中是否存在
+            # tool_use block。我们采用相同策略：以 tool_use block 的实际存在性为准，
+            # stop_reason 仅作辅助参考。
+            tool_use_blocks = [b for b in response.get("content", [])
+                               if b.get("type") == "tool_use"]
+            has_tool_use = len(tool_use_blocks) > 0
+
+            if not has_tool_use:
                 # ── Issue 14 兜底：检测模型是否在文本中描述了工具调用 ──
                 # 小模型有时会"假装调工具"——在文本中描述 Edit/Write 操作，
                 # 但不发出 <tool_call> token。检测到时注入一次性纠正提示。
@@ -440,11 +450,9 @@ Keep text responses short. Always act first, explain after."""
                 return None
 
             # ── 执行工具调用 ──────────────────────────────────────
-            # 提取所有 tool_use blocks，逐个执行
+            # 使用上面已提取的 tool_use_blocks（与 CC 对齐：基于 block 存在性）
             tool_results = []
-            for block in response.get("content", []):
-                if block.get("type") != "tool_use":
-                    continue
+            for block in tool_use_blocks:
 
                 tool_name = block["name"]
                 tool_input = block["input"]
