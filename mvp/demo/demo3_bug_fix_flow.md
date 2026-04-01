@@ -4,11 +4,30 @@
 
 完整展示一个编程 Agent 如何通过 **Localization -> Repair -> Validation (L-R-V)** 循环自动修复代码中的 bug。每一步都使用项目中实现的真实工具（ReadTool / GrepTool / EditTool / BashTool），所有 Observation 均为真实运行结果。
 
-本演示对应课程模块三（bug 修复工作流）的核心内容，展示 ReAct 框架在实际 bug 修复场景中的运作方式。
+本演示对应课程模块三（多轮纠错与防死循环）的核心内容，重点展示 **Orient 环节**——Agent 如何从测试报错中学习并做出正确判断。
 
 ---
 
-## Bug 场景描述
+## v2 演示文件（Lecture 3 主用）
+
+**目标文件**: `mvp/tests/buggy_calc.py` + `mvp/tests/test_buggy_calc.py`
+
+一个成绩统计函数，包含**两个独立的 bug**：
+- Bug 1: `avg = sum(scores) / (len(scores) - 1)` — 除数错误
+- Bug 2: `s > 60` — 及格线边界错误（应为 `>= 60`）
+
+**两阶段失败模式**：
+1. 初始运行：3 个测试失败（average + pass_rate + all_pass）
+2. 修 Bug 1 后：average 通过，但 pass_rate 仍然失败 → **这是 Orient 时刻**
+3. 修 Bug 2 后：全部 6 个测试通过
+
+**演示指令**: `"buggy_calc.py 有 bug，帮我修"`
+
+**教学重点**: 每次 Validation 失败后，暂停标注模型的 Thought——这条 Thought 就是 Orient，它决定了 Agent 是走向修复还是走向死循环。
+
+---
+
+## v1 演示记录（Lecture 1 原始 Demo，保留作为参考）
 
 **目标文件**: `mvp/tests/buggy_code.py`
 

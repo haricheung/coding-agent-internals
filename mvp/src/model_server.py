@@ -897,6 +897,18 @@ def main():
     app_port = args.port
     vllm_proc = None
 
+    # ── 端口占用预检：避免 vLLM 启动后 adapter 绑定失败留下孤儿进程 ──
+    import socket
+    ports_to_check = [("adapter", args.port)]
+    if args.model_path:
+        ports_to_check.append(("vLLM", args.vllm_port))
+    for port_name, port_num in ports_to_check:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex(("127.0.0.1", port_num)) == 0:
+                print(f"Error: port {port_num} ({port_name}) already in use. "
+                      f"Kill the old process first: lsof -ti:{port_num} | xargs kill")
+                sys.exit(1)
+
     # ── 模式 A: 传了模型路径 → 自动启动 vLLM ──────────────────────
     if args.model_path:
         model_path = os.path.abspath(args.model_path)

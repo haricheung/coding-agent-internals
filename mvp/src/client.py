@@ -267,7 +267,7 @@ Files in this project:
 {self._file_tree}
 
 CRITICAL RULES:
-1. You MUST call a tool in your FIRST response. Never reply with only text.
+1. ALWAYS explain your reasoning BEFORE calling a tool: what you observed, what you think the problem is, and what you plan to do. Then call the tool.
 2. To see file contents → call Read. NEVER make up or guess file contents.
 3. To list files → call Bash("ls") or Bash("find ..."). NEVER list files from memory.
 4. To modify a file → call Edit. To create a new file → call Write.
@@ -375,7 +375,8 @@ Keep text responses short. Always act first, explain after."""
             messages.extend(self.conversation)
 
             # ── 发送请求，接收流式响应 ────────────────────────────
-            print("\n🤖 ", end="", flush=True)
+            print(f"\n── Round {round_num}/{max_rounds} ──", flush=True)
+            print("🤖 ", end="", flush=True)
             t0 = _time.time()
             response = self._generate(messages)
             t1 = _time.time()
@@ -576,6 +577,12 @@ Keep text responses short. Always act first, explain after."""
             return None
 
         claude_response = None
+        # 用于过滤流式输出中的工具调用 JSON（fallback 路径下会出现在 content 中）
+        # 标记：<tool_call>, <function=, ```json 开头的代码块
+        _stream_buf = ""
+        _in_tool_block = False
+        # 工具调用开始标记列表
+        _tool_markers = ["<tool_call>", "<function=", "```json", "```\n{"]
 
         for line in resp.iter_lines(decode_unicode=True):
             if not line or not line.startswith("data: "):
@@ -584,13 +591,60 @@ Keep text responses short. Always act first, explain after."""
             data = json.loads(line[6:])  # 去掉 "data: " 前缀
 
             if "token" in data:
-                # 实时打印 token（流式输出的视觉效果）
-                print(data["token"], end="", flush=True)
+                token = data["token"]
+                # 过滤 Qwen 特殊 token
+                token = token.replace("<|im_start|>", "").replace("<|im_end|>", "")
+                if not token:
+                    continue
+                _stream_buf += token
+
+                if not _in_tool_block:
+                    # 检查是否进入工具调用块
+                    marker_pos = -1
+                    for marker in _tool_markers:
+                        pos = _stream_buf.find(marker)
+                        if pos >= 0:
+                            marker_pos = pos
+                            break
+                    if marker_pos >= 0:
+                        # 打印标记之前的文本
+                        before = _stream_buf[:marker_pos]
+                        if before:
+                            print(before, end="", flush=True)
+                        _stream_buf = _stream_buf[marker_pos:]
+                        _in_tool_block = True
+                    else:
+                        # 保留缓冲以检测跨 token 的标记（最长标记约 12 字符）
+                        safe = _stream_buf[:-15] if len(_stream_buf) > 15 else ""
+                        if safe:
+                            print(safe, end="", flush=True)
+                            _stream_buf = _stream_buf[len(safe):]
+
+                if _in_tool_block:
+                    # 检查工具调用块结束
+                    for end_tag in ["</tool_call>", "</function>"]:
+                        if end_tag in _stream_buf:
+                            after = _stream_buf[_stream_buf.index(end_tag) + len(end_tag):]
+                            _stream_buf = after
+                            _in_tool_block = False
+                            break
+                    # ```json ... ``` 块：检测末尾的 ```
+                    if _in_tool_block and _stream_buf.startswith("```"):
+                        # 找闭合的 ```（跳过开头）
+                        close = _stream_buf.find("```", 3)
+                        if close >= 0:
+                            after = _stream_buf[close + 3:]
+                            _stream_buf = after
+                            _in_tool_block = False
 
             elif data.get("done"):
                 # 推理结束，获取结构化响应
                 # 这是适配层的输出：Qwen 原始文本已被解析为 Claude content blocks
                 claude_response = data.get("response")
+
+        # 刷新缓冲区中剩余的非工具调用文本
+        if _stream_buf and not _in_tool_block:
+            print(_stream_buf, end="", flush=True)
 
         return claude_response
 

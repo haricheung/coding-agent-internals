@@ -141,17 +141,13 @@ class Trajectory:
             "response": None,
             "start_time": time.time()
         }
-        print(f"\n[Round {round_num}]", flush=True)
+        # Round header 由 client.py 打印，这里不重复
 
     def record_thought(self, thought: str):
         """记录模型的思考/推理文本"""
         if self._current_round is not None:
             self._current_round["thought"] = thought
-            # 截断显示
-            display = thought[:200].replace('\n', ' ')
-            if len(thought) > 200:
-                display += "..."
-            print(f"  [Thought]  {display}", flush=True)
+            # Thought 已由 client.py 的流式输出 🤖 打印，不重复
 
     def record_action(self, tool_name: str, tool_input: Dict, tool_output: str,
                       duration: float, is_error: bool = False,
@@ -185,10 +181,7 @@ class Trajectory:
         """记录模型的最终回答（end_turn）"""
         if self._current_round is not None:
             self._current_round["response"] = response
-            display = response[:300].replace('\n', ' ')
-            if len(response) > 300:
-                display += "..."
-            print(f"  [Response] {display}", flush=True)
+            # Response 已由 client.py 的流式输出打印，不重复
 
     def end_round(self):
         """结束当前轮"""
