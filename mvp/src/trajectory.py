@@ -177,6 +177,14 @@ class Trajectory:
         status = "Error" if is_error else "OK"
         print(f"  [Result]   ({status}, {duration:.2f}s) {output_preview}", flush=True)
 
+    def record_reflexion(self, tag: str, prompt_text: str):
+        """记录 Reflexion 注入事件（[ANALYZE] 或 [REFLECT]）"""
+        if self._current_round is not None:
+            self._current_round["reflexion"] = {
+                "tag": tag,
+                "prompt": prompt_text
+            }
+
     def record_response(self, response: str):
         """记录模型的最终回答（end_turn）"""
         if self._current_round is not None:

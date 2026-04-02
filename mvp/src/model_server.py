@@ -140,6 +140,7 @@ def generate_stream(request: GenerateRequest):
         return
 
     full_content = ""
+    full_reasoning = ""
     tool_calls_acc = {}  # index → {id, name, arguments}
     finish_reason = None
 
@@ -157,6 +158,12 @@ def generate_stream(request: GenerateRequest):
 
         choice = data["choices"][0]
         delta = choice.get("delta", {})
+
+        # 流式传递 thinking token（Qwen3 thinking mode）
+        if delta.get("reasoning_content") or delta.get("reasoning"):
+            token = delta.get("reasoning_content") or delta.get("reasoning")
+            full_reasoning += token
+            yield f"data: {json.dumps({'thinking': token})}\n\n"
 
         # 流式传递文本 token
         if delta.get("content"):
@@ -815,8 +822,23 @@ def _detect_tool_parser(model_path: str) -> str:
     return "hermes"
 
 
+def _detect_reasoning_parser(model_path: str) -> str:
+    """根据模型架构自动选择 vLLM reasoning parser（thinking mode）。"""
+    config_path = os.path.join(model_path, "config.json")
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            cfg = json.load(f)
+        arch = (cfg.get("architectures") or [""])[0].lower()
+        if "qwen3" in arch:
+            return "qwen3"
+        if "deepseek" in arch:
+            return "deepseek_r1"
+    return "deepseek_r1"  # fallback
+
+
 def _launch_vllm(model_path: str, port: int, gpus: List[int], tp: int,
-                  extra_args: List[str] = None) -> subprocess.Popen:
+                  extra_args: List[str] = None,
+                  enable_thinking: bool = False) -> subprocess.Popen:
     """启动 vLLM serve 子进程。"""
     gpu_str = ",".join(str(g) for g in gpus[:tp])
     env = os.environ.copy()
@@ -832,6 +854,13 @@ def _launch_vllm(model_path: str, port: int, gpus: List[int], tp: int,
         "--enable-auto-tool-choice",
         "--tool-call-parser", parser_name,
     ]
+    if enable_thinking:
+        reasoning_parser = _detect_reasoning_parser(model_path)
+        cmd.extend([
+            "--reasoning-parser", reasoning_parser,
+            "--default-chat-template-kwargs", json.dumps({"enable_thinking": True}),
+        ])
+        print(f"  Thinking mode: ON (reasoning-parser={reasoning_parser})")
     if extra_args:
         cmd.extend(extra_args)
 
@@ -888,6 +917,8 @@ def main():
     parser.add_argument("--host", default="0.0.0.0", help="适配层地址 (default: 0.0.0.0)")
     parser.add_argument("--no-trace", action="store_true",
                         help="禁用 trajectory 日志")
+    parser.add_argument("--enable-thinking", action="store_true",
+                        help="启用模型 thinking mode（Qwen3 <think> tokens）")
     args = parser.parse_args()
 
     if not args.model_path and not args.vllm_url:
@@ -934,7 +965,8 @@ def main():
             print(f"Auto-detected: model needs TP={tp}, using GPUs {gpus}")
 
         # 启动 vLLM
-        vllm_proc = _launch_vllm(model_path, args.vllm_port, gpus, tp, extra_args)
+        vllm_proc = _launch_vllm(model_path, args.vllm_port, gpus, tp, extra_args,
+                                  enable_thinking=args.enable_thinking)
 
         if not _wait_for_vllm(VLLM_URL):
             print("Error: vLLM failed to start. Check GPU memory / model path.")

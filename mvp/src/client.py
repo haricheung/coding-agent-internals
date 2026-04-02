@@ -523,6 +523,45 @@ Keep text responses short. Always act first, explain after."""
                         f"If user asked to fix/repair, do Read → Edit → Bash then STOP.]"
             }
 
+            # ── Reflexion: 测试失败后注入反思提示 ────────────────
+            # Reflexion (Shinn et al., 2023) 的核心机制：
+            # 看到测试失败后，强制模型产生结构化分析（CoT），
+            # 而不是跳过推理直接行动。
+            # 两种触发场景：
+            #   1. 首次失败：分析错误信息，形成修复假设
+            #   2. 修复后仍失败：反思上次修复为什么没用
+            reflection_prompt = None
+            has_prior_edit = any(
+                b.get("name") == "Edit"
+                for msg in self.conversation
+                if msg.get("role") == "assistant"
+                for b in msg.get("content", [])
+                if isinstance(b, dict) and b.get("type") == "tool_use"
+            )
+            for tr in tool_results:
+                output = tr.get("content", "")
+                if "FAILED" in output:
+                    if has_prior_edit:
+                        reflection_prompt = {
+                            "type": "text",
+                            "text": "[REFLECT] Your previous fix did NOT solve all failures. "
+                                    "Before editing again: "
+                                    "1) Which test STILL fails and what is the exact error value? "
+                                    "2) Why didn't your last edit fix it? "
+                                    "3) What is the REAL root cause? "
+                                    "Read the file if needed, then Edit the correct line."
+                        }
+                    else:
+                        reflection_prompt = {
+                            "type": "text",
+                            "text": "[ANALYZE] Before fixing, analyze the errors: "
+                                    "1) What are the exact wrong values vs expected values? "
+                                    "2) Work backwards: what calculation could produce the wrong value? "
+                                    "3) Form a hypothesis for each failing test. "
+                                    "Then Read the code and Edit to fix."
+                        }
+                    break
+
             # ── Last-round nudge ──────────────────────────────────
             # Worker 快到轮次上限时，注入紧急提醒让它调 SendMessage。
             # 这比纯靠 system prompt 有效——距离近、时机准、模型注意力集中。
@@ -534,9 +573,17 @@ Keep text responses short. Always act first, explain after."""
                     "text": f"[URGENT: You have 1 round left. You MUST call SendMessage(to=\"lead\") NOW to report your results. Do NOT call any other tool.]"
                 })
 
+            # ── 可视化 Reflexion 注入（演示用）──────────────────
+            if reflection_prompt:
+                tag = "[REFLECT]" if has_prior_edit else "[ANALYZE]"
+                print(f"\n  💡 Reflexion injected: {tag}", flush=True)
+                traj.record_reflexion(tag, reflection_prompt["text"])
+
             self.conversation.append({
                 "role": "user",
-                "content": tool_results + [intent_reminder] + extras
+                "content": tool_results + [intent_reminder]
+                           + ([reflection_prompt] if reflection_prompt else [])
+                           + extras
             })
 
         trace("loop exit: max_rounds reached", rounds=max_rounds)
@@ -583,6 +630,8 @@ Keep text responses short. Always act first, explain after."""
         _in_tool_block = False
         # 工具调用开始标记列表
         _tool_markers = ["<tool_call>", "<function=", "```json", "```\n{"]
+        # Thinking mode 状态
+        _in_thinking = False
 
         for line in resp.iter_lines(decode_unicode=True):
             if not line or not line.startswith("data: "):
@@ -590,7 +639,18 @@ Keep text responses short. Always act first, explain after."""
 
             data = json.loads(line[6:])  # 去掉 "data: " 前缀
 
+            if "thinking" in data:
+                token = data["thinking"]
+                if not _in_thinking:
+                    _in_thinking = True
+                    print("\n  💭 Thinking: ", end="", flush=True)
+                print(token, end="", flush=True)
+                continue
+
             if "token" in data:
+                if _in_thinking:
+                    _in_thinking = False
+                    print("\n  ── End thinking ──\n  ", end="", flush=True)
                 token = data["token"]
                 # 过滤 Qwen 特殊 token
                 token = token.replace("<|im_start|>", "").replace("<|im_end|>", "")

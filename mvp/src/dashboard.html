@@ -110,6 +110,10 @@ pre { background: #0d1117; border: 1px solid var(--border); border-radius: var(-
 .tool-pill.Agent { background: var(--pink); }
 .tool-pill.TaskCreate,.tool-pill.TaskUpdate,.tool-pill.TaskList { background: var(--text-faint); }
 
+/* Reflexion injection marker */
+.tao-step.step-Reflexion .step-letter { color: #f0c040; }
+.reflexion-tag { display: inline-block; padding: 1px 8px; border-radius: 3px; font-size: 11px; font-weight: 600; color: #fff; background: #b8860b; }
+
 /* Loop-back arrow between rounds */
 .tao-loop-arrow { text-align: center; color: var(--text-faint); font-size: 18px; margin: -8px 0 8px 0; padding-left: 28px; }
 
@@ -327,6 +331,19 @@ function renderTrajectoryDetail(data) {
       obsHtml += '</div></div>';
       html += obsHtml;
     });
+
+    // ── Reflexion injection marker ──
+    if (rnd.reflexion) {
+      html += `<div class="tao-step step-Reflexion">
+        <div class="step-box">
+          <div class="step-header">
+            <span class="step-letter">&#x1F4A1; Reflexion</span>
+            <span class="reflexion-tag">${escHtml(rnd.reflexion.tag)}</span>
+          </div>
+          <div class="step-text">${escHtml(rnd.reflexion.prompt)}</div>
+        </div>
+      </div>`;
+    }
 
     // ── R: Final Response (only on end_turn rounds) ──
     if (rnd.response) {

@@ -1,0 +1,20 @@
+{
+  "session_id": "20260401_115516",
+  "parent_session_id": null,
+  "start_time": "2026-04-01T11:55:16.419618",
+  "user_input": "修复下 buggy_calc.py 错误",
+  "rounds": [
+    {
+      "round": 1,
+      "thought": null,
+      "actions": [],
+      "response": null,
+      "duration": 0.01
+    }
+  ],
+  "summary": {
+    "total_rounds": 1,
+    "tool_calls": 0,
+    "duration": 0.01
+  }
+}
