@@ -20,7 +20,7 @@ Model Server —— Claude 协议适配层 + Dashboard
 
 Usage:
     # 一键启动（自动检测空闲 GPU、启动 vLLM、启动适配层）
-    python model_server.py /path/to/Qwen2.5-Coder-7B-Instruct
+    python model_server.py /path/to/Qwen3-30B-A3B
 
     # 指定 GPU
     python model_server.py /path/to/model --gpu 5,6
@@ -110,11 +110,32 @@ def generate_stream(request: GenerateRequest):
 
     openai_messages = claude_messages_to_openai(request.messages)
 
+    # ── Step 1.5: 将工具注入 system prompt（不依赖 vLLM --enable-auto-tool-choice）──
+    # Qwen 的 chat template 期望工具定义以 <tools> 标签出现在 system 消息中。
+    # 直接在 system message 中注入，vLLM 只需做普通 chat completion，
+    # 工具调用以 <tool_call> 标签出现在 content 中，由 parser.py 兜底解析。
+    if openai_tools and openai_messages:
+        tools_text = "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n"
+        for tool in openai_tools:
+            tools_text += json.dumps(tool, ensure_ascii=False) + "\n"
+        tools_text += "</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>"
+
+        # 找到 system 消息并追加工具定义
+        injected = False
+        for msg in openai_messages:
+            if msg.get("role") == "system":
+                msg["content"] = msg["content"] + tools_text
+                injected = True
+                break
+        if not injected:
+            openai_messages.insert(0, {"role": "system", "content": tools_text})
+
     trace("generate_stream: openai conversion",
           tools=len(request.tools) if request.tools else 0,
           messages=len(openai_messages))
 
     # ── Step 2: 构造 OpenAI API 请求 ────────────────────────────────
+    # 注意：不传 tools 字段，工具定义已注入 system message
     payload = {
         "model": VLLM_MODEL_NAME,
         "messages": openai_messages,
@@ -122,8 +143,6 @@ def generate_stream(request: GenerateRequest):
         "temperature": max(request.temperature, 0.01),
         "stream": True,
     }
-    if openai_tools:
-        payload["tools"] = openai_tools
 
     # ── Step 3: 流式调用 vLLM ───────────────────────────────────────
     try:
@@ -135,8 +154,15 @@ def generate_stream(request: GenerateRequest):
         )
         resp.raise_for_status()
     except _requests.RequestException as e:
-        trace("generate_stream: vllm request failed", error=str(e))
-        yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        # Extract response body for better error diagnosis
+        error_detail = str(e)
+        if hasattr(e, 'response') and e.response is not None:
+            try:
+                error_detail = e.response.text[:500]
+            except Exception:
+                pass
+        trace("generate_stream: vllm request failed", error=error_detail[:200])
+        yield f"data: {json.dumps({'error': error_detail[:500]})}\n\n"
         return
 
     full_content = ""
@@ -154,6 +180,19 @@ def generate_stream(request: GenerateRequest):
         try:
             data = json.loads(payload_str)
         except json.JSONDecodeError:
+            continue
+
+        # vLLM 返回错误（如 context length exceeded）时，
+        # 没有 "choices" 字段，需要单独处理
+        if "error" in data:
+            error_msg = data["error"]
+            if isinstance(error_msg, dict):
+                error_msg = error_msg.get("message", str(error_msg))
+            trace("generate_stream: vllm stream error", error=str(error_msg)[:200])
+            yield f"data: {json.dumps({'error': str(error_msg)})}\n\n"
+            continue
+
+        if "choices" not in data or not data["choices"]:
             continue
 
         choice = data["choices"][0]
@@ -572,11 +611,35 @@ async def demo_agent(req: DemoRequest):
 
                 conversation = [{"role": "user", "content": req.prompt}]
                 already_nudged = False
-                max_rounds = 10
+                max_rounds = 15
+                keep_recent = 3  # microcompact: keep last N messages intact
 
                 for round_num in range(1, max_rounds + 1):
+                    # Microcompact: clear old tool results（对齐 client.py）
+                    if len(conversation) > keep_recent:
+                        cutoff = len(conversation) - keep_recent
+                        for msg in conversation[:cutoff]:
+                            if msg.get("role") != "user":
+                                continue
+                            content = msg.get("content")
+                            if not isinstance(content, list):
+                                continue
+                            for block in content:
+                                if (isinstance(block, dict)
+                                        and block.get("type") == "tool_result"
+                                        and isinstance(block.get("content"), str)
+                                        and len(block["content"]) > 200):
+                                    block["content"] = "[Old tool result content cleared]"
+
                     messages = [{"role": "system", "content": system_prompt}]
                     messages.extend(conversation)
+
+                    # 预算警告：倒数第2轮注入合成提示，迫使模型输出答案
+                    if round_num >= max_rounds - 1:
+                        messages.append({
+                            "role": "user",
+                            "content": "IMPORTANT: You are running out of rounds. STOP searching and WRITE YOUR FINAL ANSWER NOW based on what you have found so far. Do NOT call any more tools — just summarize your findings."
+                        })
 
                     response = call_model(messages)
                     if response is None:
@@ -599,11 +662,22 @@ async def demo_agent(req: DemoRequest):
 
                     # 非 tool_use 响应
                     if not has_tool_calls:
+                        # 预算警告轮次：直接接受文本响应作为最终答案（不 nudge）
+                        if round_num >= max_rounds - 1:
+                            q.put({"type": "final", "round": round_num,
+                                   "content": thought_text})
+                            break
+
                         # Nudge 机制（与 client.py Issue 14 一致）
+                        # 使用更严格的匹配：工具名后跟 ( 或前有动词
                         full_text = " ".join(thought_parts)
                         check_tools = [t for t in tools.keys()
                                        if t in ("Edit", "Write", "Bash", "Grep")]
-                        mentioned = [t for t in check_tools if t in full_text]
+                        mentioned = []
+                        for t in check_tools:
+                            import re as _re
+                            if _re.search(rf'\b{t}\s*\(', full_text) or _re.search(rf'(?:call|use|invoke|run)\s+{t}\b', full_text):
+                                mentioned.append(t)
 
                         if mentioned and not already_nudged:
                             already_nudged = True

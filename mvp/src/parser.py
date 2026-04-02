@@ -44,7 +44,7 @@ def _strip_line_comments(text: str) -> str:
     """
     去除 JS 风格的单行注释（// ...），但保留 JSON 字符串内的 //。
 
-    7B 模型有时在生成 JSON 时混入 JS 注释，例如：
+    模型有时在生成 JSON 时混入 JS 注释，例如：
         {"file_path": "/tmp/a.py",  // target file
          "old_string": "x = 1"}
 
@@ -78,7 +78,7 @@ def _sanitize_json(text: str) -> str:
     """
     修复小模型常见的 JSON 畸变。
 
-    问题背景：7B 模型在生成 JSON 时经常产生格式错误，
+    问题背景：小模型在生成 JSON 时经常产生格式错误，
     因为 JSON 的严格语法（每个引号、逗号都必须精确）
     与模型的概率生成机制天然冲突。
 

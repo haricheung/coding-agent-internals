@@ -13,7 +13,7 @@ Agent 工具集 —— 编程 Agent 的「手和脚」
 
 工具演进路线（对应 4 天开发计划）：
     Day 1: Read, Write, Bash         — 基础文件操作 + 命令执行
-    Day 2: + Edit, Grep              — 精确编辑 + 代码搜索（本次新增）
+    Day 2: + Edit, Glob, Grep        — 精确编辑 + 文件搜索 + 代码搜索
     Day 3: + TaskCreate/Update/List  — 任务管理（在 task_tools.py 中实现）
     Day 4: + Agent                   — 子 Agent 生成（在 agent_tool.py 中实现）
 
@@ -86,15 +86,24 @@ class ReadTool(Tool):
 
     分页设计（ACI 信息粒度控制）：
         offset 和 limit 参数实现了「按需精读」能力。
-        为什么需要分页？因为 7B 模型的上下文窗口有限（通常 8K-32K tokens），
-        一个 500 行的文件可能就占掉 2000+ tokens。
-        如果 Agent 一次性读入整个大文件，后续推理的质量会显著下降——
-        这就是课程中讲的「上下文窗口是稀缺资源，要精打细算」。
+        上下文窗口是稀缺资源——一个 500 行的文件可能就占掉 2000+ tokens。
+        如果 Agent 一次性读入整个大文件，后续推理的质量会显著下降。
 
         分页策略：
-        - 不传 offset/limit → 读取全文（小文件场景，简单直接）
+        - 不传 offset/limit → 小文件读全文，大文件拒绝并提示用分页
         - 传 offset=50, limit=30 → 只读第 50-79 行（大文件精确定位）
         - 输出带行号前缀（如 "  50 | code here"），方便模型定位和引用
+
+    大文件防护（对齐 CC 的 token gate 设计）：
+        CC 的 FileReadTool 用两层防护：
+        1. 文件大小 > 256KB → FileTooLargeError（预读检查）
+        2. 输出 token > 25,000 → MaxFileReadTokenExceededError（后读检查）
+        两层都返回错误信息，引导模型用 offset/limit 重新读取。
+
+        我们简化为行数检查（MAX_LINES_WITHOUT_LIMIT = 250 行）：
+        超过时返回 Error + 文件前 20 行预览 + 总行数，
+        引导模型用 Grep/Glob 搜索或 offset/limit 读取需要的部分。
+        关键设计：返回 Error（不是静默截断），迫使模型学习分页行为。
 
     带行号输出的设计意图：
         行号不仅是给人看的，更是给模型看的。
@@ -102,13 +111,22 @@ class ReadTool(Tool):
         格式 "  行号 | 内容" 模仿了 cat -n 的输出，模型在训练数据中见过大量这种格式。
     """
 
+    # 大文件门槛：超过此行数且未指定 limit 时，返回错误而非全文
+    # CC 用 2000 行（200K context），按比例：2000 * (16K/200K) ≈ 160 行
+    # 取 250 行稍留余量——小于此的文件可直接整文件阅读
+    MAX_LINES_WITHOUT_LIMIT = 250
+    # 错误时预览的行数（够模型判断文件结构，不必太多）
+    PREVIEW_LINES = 20
+
     def __init__(self):
         super().__init__(
             name="Read",
             description=(
                 "Read the contents of a file. "
                 "Returns the file content with line numbers. "
-                "Use offset and limit for large files to read specific sections. "
+                "For large files (over 250 lines), use Grep or Glob to search first, "
+                "or specify offset and limit to read a section. "
+                "Do NOT read a large file page by page — use Grep to find the relevant lines first. "
                 "Example: offset=10, limit=20 reads lines 10-29."
             ),
             parameters={
@@ -141,12 +159,16 @@ class ReadTool(Tool):
         """
         读取文件内容，返回带行号的文本。
 
-        执行流程：
-        1. 检查文件是否存在
-        2. 读取全部行
-        3. 根据 offset/limit 切片（如果指定了的话）
-        4. 添加行号前缀
-        5. 附加元信息（总行数、当前显示范围）
+        大文件防护（对齐 CC 的 token gate）：
+            CC 的 FileReadTool 在读取后检查 token 数，超过 25K tokens 时
+            抛出 MaxFileReadTokenExceededError，告诉模型"file too large,
+            use offset and limit"。我们用行数做类似检查：
+            - 文件 > MAX_LINES_WITHOUT_LIMIT 且未指定 limit → 返回 Error
+            - Error 包含文件前 PREVIEW_LINES 行 + 总行数 → 模型有足够信息重试
+
+            关键：返回 Error 而非静默截断。这与 CC 的设计一致——
+            Error 是 ACI 原则三"信息丰富的反馈"的体现，
+            迫使模型主动学习用 offset/limit 精确读取。
 
         Args:
             file_path: 文件绝对路径
@@ -156,6 +178,12 @@ class ReadTool(Tool):
         Returns:
             带行号的文件内容，或错误信息
         """
+        # 模型可能传入字符串类型的数字（如 "130"），需要强制转换
+        if offset is not None:
+            offset = int(offset)
+        if limit is not None:
+            limit = int(limit)
+
         try:
             if not os.path.exists(file_path):
                 return f"Error: File not found: {file_path}"
@@ -165,10 +193,32 @@ class ReadTool(Tool):
 
             total_lines = len(lines)
 
+            # ── 大文件防护（CC token gate 的简化版）──────────────────
+            # 未指定 offset/limit 且文件过大 → 返回 Error + 预览
+            # 这迫使模型用 offset/limit 重试，而非被大文件撑爆上下文
+            if (offset is None and limit is None
+                    and total_lines > self.MAX_LINES_WITHOUT_LIMIT):
+                # 给模型前 N 行预览，帮助它决定需要读哪个范围
+                preview = lines[:self.PREVIEW_LINES]
+                width = len(str(total_lines))
+                preview_text = "\n".join(
+                    f"{i+1:>{width}} | {line.rstrip()}"
+                    for i, line in enumerate(preview)
+                )
+                return (
+                    f"Error: File too large ({total_lines} lines). "
+                    f"Use Grep to search for specific patterns instead of reading the whole file. "
+                    f"If you must read, specify offset and limit. "
+                    f"Example: Grep(pattern=\"validate|reject|error\", path=\"{file_path}\") "
+                    f"or Read(file_path=\"{file_path}\", offset=0, limit=100)\n\n"
+                    f"Preview (first {self.PREVIEW_LINES} lines):\n{preview_text}"
+                )
+
             # ── 分页切片 ──────────────────────────────────────────────
-            # offset 默认为 0（文件开头），limit 默认为 total_lines（读到末尾）
+            # CC 不限制单次 Read 的行数——只在无 limit 时触发大文件门槛
+            # 真正的上下文保护靠 microcompact（清除旧工具结果）
             start = offset if offset is not None else 0
-            end = start + limit if limit is not None else total_lines
+            end = start + (limit if limit is not None else total_lines - start)
 
             # 边界保护：防止 offset 超出文件范围
             start = max(0, min(start, total_lines))
@@ -418,6 +468,110 @@ class EditTool(Tool):
 
 
 # ===========================================================================
+# Glob 工具 —— 文件模式匹配（对标 CC 的 GlobTool）
+# ===========================================================================
+
+class GlobTool(Tool):
+    """
+    通过 glob 模式查找文件（如 **/*.ts, src/**/test_*.py）。
+
+    这是从 Bash("find ...") 升级为专用工具的关键改进（课程 §4.6 工具映射）：
+    - SWE-agent 的 find_file → CC 的 Glob → MVP 的 Glob
+    - 专用工具输出更紧凑（只返回文件路径），符合 ACI "紧凑输出"原则
+    - 比 Bash find 更安全（不会执行任意命令）
+
+    在 Localization 漏斗中的角色（Agentless 第一层）：
+        Glob 是"文件级定位"的核心工具：
+        Glob("**/*Edit*.ts") → 找到 FileEditTool 相关文件
+        → Grep("validate", path=<file>) → 定位具体代码
+        → Read(file, offset=N, limit=50) → 精读
+
+    输出限制：最多返回 100 个文件路径（CC 同样限制 100）。
+    """
+
+    MAX_RESULTS = 100
+
+    def __init__(self, working_dir: str = None):
+        self.working_dir = working_dir or os.getcwd()
+        super().__init__(
+            name="Glob",
+            description=(
+                "Find files matching a glob pattern. "
+                "Returns file paths sorted by modification time. "
+                "Use patterns like '**/*.ts' to find all TypeScript files, "
+                "or '**/FileEdit*' to find files by name. "
+                "Max 100 results."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": (
+                            "Glob pattern to match files. "
+                            "Examples: '**/*.py', 'src/**/*.ts', '**/test_*.py', '**/Edit*'"
+                        )
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Directory to search in. Defaults to working directory if omitted."
+                        )
+                    }
+                },
+                "required": ["pattern"]
+            }
+        )
+
+    def execute(self, pattern: str, path: str = None) -> str:
+        """
+        执行 glob 匹配，返回文件路径列表。
+
+        使用 Python 的 glob.glob(recursive=True) 实现，
+        支持 ** 跨目录匹配。
+
+        Args:
+            pattern: glob 模式（如 **/*.ts）
+            path: 搜索目录，None 则用当前工作目录
+
+        Returns:
+            匹配的文件路径列表（每行一个），或错误信息
+        """
+        import glob as _glob
+
+        try:
+            search_dir = path or self.working_dir
+            if not os.path.isdir(search_dir):
+                return f"Error: Directory not found: {search_dir}"
+
+            # 构造完整 glob 路径
+            full_pattern = os.path.join(search_dir, pattern)
+            matches = _glob.glob(full_pattern, recursive=True)
+
+            # 只保留文件（排除目录）
+            files = [f for f in matches if os.path.isfile(f)]
+
+            # 按修改时间排序（最近修改的在前），对齐 CC 的行为
+            files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
+
+            total = len(files)
+            truncated = total > self.MAX_RESULTS
+            files = files[:self.MAX_RESULTS]
+
+            if not files:
+                return f"No files found matching pattern '{pattern}' in {search_dir}"
+
+            result = "\n".join(files)
+            if truncated:
+                result += f"\n\n[Showing {self.MAX_RESULTS} of {total} matches]"
+
+            return result
+
+        except Exception as e:
+            return f"Error: {str(e)}"
+
+
+# ===========================================================================
 # Grep 工具 —— 代码搜索（正则 + 递归 + 行数限制）
 # ===========================================================================
 
@@ -517,6 +671,8 @@ class GrepTool(Tool):
         Returns:
             匹配结果（文件路径:行号: 内容），或错误信息
         """
+        if head_limit is not None:
+            head_limit = int(head_limit)
         try:
             # ── Step 1: 编译正则 ──────────────────────────────────────
             try:
@@ -734,6 +890,7 @@ def get_tools(working_dir: str = None) -> Dict[str, Tool]:
         "Read": ReadTool(),
         "Write": WriteTool(),
         "Edit": EditTool(),
+        "Glob": GlobTool(working_dir=working_dir),
         "Grep": GrepTool(),
         "Bash": BashTool(working_dir=working_dir),
     }

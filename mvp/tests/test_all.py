@@ -947,9 +947,9 @@ class TestClientIntegration(unittest.TestCase):
         all_tools.update(get_tools(working_dir='/tmp'))
         all_tools.update(get_task_tools(store))
         all_tools.update(get_agent_tool('http://localhost:9981', '/tmp', store))
-        self.assertEqual(len(all_tools), 9)
+        self.assertEqual(len(all_tools), 10)
         expected = [
-            'Read', 'Write', 'Edit', 'Grep', 'Bash',
+            'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash',
             'TaskCreate', 'TaskUpdate', 'TaskList', 'Agent'
         ]
         for name in expected:
@@ -967,7 +967,7 @@ class TestClientIntegration(unittest.TestCase):
         all_tools.update(get_task_tools(store))
         all_tools.update(get_agent_tool('http://localhost:9981', '/tmp', store))
         defs = get_tool_definitions(all_tools)
-        self.assertEqual(len(defs), 9)
+        self.assertEqual(len(defs), 10)
         for d in defs:
             # 每个定义必须包含 name, description, input_schema
             self.assertIn('name', d)

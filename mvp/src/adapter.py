@@ -15,7 +15,7 @@ Claude ↔ Qwen 协议适配层
     这个适配层做的事情，本质上就是 Anthropic API 基础设施在做的事——
     把模型的原始文本输出结构化为 typed content blocks。区别是：
     Anthropic 用前沿模型 + 约束解码做确定性保证；
-    我们用 7B 模型 + 鲁棒解析做概率性兜底。
+    我们用本地模型 + 鲁棒解析做概率性兜底。
 
 协议格式对比：
 
@@ -317,7 +317,7 @@ def qwen_response_to_claude(raw_text: str) -> Dict[str, Any]:
 
     区别在于：
     - Anthropic 有前沿模型（几乎不出格式错）+ 约束解码（确定性保证）
-    - 我们有 7B 模型（可能出格式错）+ parser.py 的鲁棒解析（概率性兜底）
+    - 我们有本地模型（可能出格式错）+ parser.py 的鲁棒解析（概率性兜底）
 
     转换规则：
     - 原始文本中的 <tool_call> 块 → {"type": "tool_use", "id": ..., "name": ..., "input": ...}

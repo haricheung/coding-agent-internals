@@ -44,7 +44,7 @@ Agent Team 的协作模型：
        - 每个 Agent() 调用会启动一个线程执行子 Agent
        - 子 Agent 在线程中运行自己的 ReAct 循环
        - 主 Agent 通过 TaskList 轮询获取完成状态
-       - 最大并行数限制为 3（防止 GPU 过载，7B 模型单 GPU 吞吐有限）
+       - 最大并行数限制为 3（防止 GPU 过载，本地模型单 GPU 吞吐有限）
 
     4. 简化设计（教学优先）
        真实的 Claude Code Agent Team 使用进程级隔离（subprocess），
@@ -254,7 +254,7 @@ class AgentTool(Tool):
 
     在 MVP 教学场景中：
     我们演示的是「子 Agent 独立执行」的概念，而非真正的 GPU 并行推理。
-    7B 模型在单 GPU 上无法真正并行推理，所以多个子 Agent 实际上是串行执行的。
+    本地模型在单 GPU 上无法真正并行推理，所以多个子 Agent 实际上是串行执行的。
     但概念上，它们各自拥有独立上下文，这是 Agent Team 的核心。
     """
 

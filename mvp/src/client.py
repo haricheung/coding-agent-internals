@@ -105,7 +105,7 @@ class Client:
     - 客户端不做任何文本解析，所有格式转换在 model_server 适配层完成
 
     工具集构成：
-    - 基础工具（tools.py）：Read, Write, Edit, Grep, Bash
+    - 基础工具（tools.py）：Read, Write, Edit, Glob, Grep, Bash
     - 任务工具（task_tools.py）：TaskCreate, TaskUpdate, TaskList
     - Agent 工具（agent_tool.py）：Agent（子 Agent 生成）
     所有工具通过统一的 self.tools 字典管理，execute 接口一致。
@@ -135,7 +135,7 @@ class Client:
         # 这使得 _execute_tool() 只需一次字典查找即可调用任何工具
         self.tools: Dict[str, Any] = {}
 
-        # Day 1-2 基础工具：Read, Write, Edit, Grep, Bash
+        # Day 1-2 基础工具：Read, Write, Edit, Glob, Grep, Bash
         self.tools.update(get_tools(working_dir=self.working_dir))
 
         # Day 3 任务管理工具：TaskCreate, TaskUpdate, TaskList
@@ -190,14 +190,20 @@ class Client:
         """
         扫描工作目录，生成文件树快照。
 
-        限制 50 行是有意为之的 ACI 设计决策（课程 2.2 节内容）：
-        - 给模型"刚好够定位"的信息量（粗粒度全景）
-        - 模型需要精读时再用 Read 工具按需获取（细粒度局部）
-        - 防止大项目的文件列表挤占有限的上下文窗口
+        ACI 信息粒度控制（Agentless 第一层：看文件树）：
+        - 小项目（< 50 行输出）：显示完整文件树（目录 + 文件）
+        - 大项目（> 50 行）：只显示前两层目录结构（深层只显示目录名）
+          → 让模型看到项目的"骨架"（哪些模块存在），足够定位搜索范围
+          → 模型需要看具体文件时再用 Glob 或 Grep
+        - 上限 80 行，防止大项目的文件列表挤占上下文窗口
         """
+        MAX_LINES = 80
+        SKIP_DIRS = {'.git', '__pycache__', 'node_modules', '.venv', 'venv'}
+
+        # 先尝试完整文件树（目录 + 文件）
         lines = []
         for root, dirs, files in os.walk(self.working_dir):
-            dirs[:] = [d for d in dirs if not d.startswith('.') and d != '__pycache__']
+            dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith('.'))
             depth = root.replace(self.working_dir, '').count(os.sep)
             indent = '  ' * depth
             basename = os.path.basename(root) or '.'
@@ -205,7 +211,33 @@ class Client:
             for f in sorted(files):
                 if not f.startswith('.'):
                     lines.append(f"{indent}  {f}")
-        return '\n'.join(lines[:50])
+
+        if len(lines) <= MAX_LINES:
+            return '\n'.join(lines)
+
+        # 大项目：两层深度的目录 + 文件混合视图
+        # 深度 0-1 显示文件，深度 2+ 只显示目录名
+        dir_lines = []
+        for root, dirs, files in os.walk(self.working_dir):
+            dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith('.'))
+            depth = root.replace(self.working_dir, '').count(os.sep)
+            indent = '  ' * depth
+            basename = os.path.basename(root) or '.'
+
+            if depth <= 2:
+                # 浅层：显示目录名 + 文件数
+                visible_files = [f for f in files if not f.startswith('.')]
+                file_count = len(visible_files)
+                dir_lines.append(f"{indent}{basename}/  ({file_count} files)")
+                # 深度 0-1 列出文件名
+                if depth <= 1:
+                    for f in sorted(visible_files):
+                        dir_lines.append(f"{indent}  {f}")
+            else:
+                # 深层：只在父目录的行里汇总（不单独列出）
+                pass
+
+        return '\n'.join(dir_lines[:MAX_LINES])
 
     def get_system_prompt(self) -> str:
         """
@@ -269,16 +301,28 @@ Files in this project:
 CRITICAL RULES:
 1. ALWAYS explain your reasoning BEFORE calling a tool: what you observed, what you think the problem is, and what you plan to do. Then call the tool.
 2. To see file contents → call Read. NEVER make up or guess file contents.
-3. To list files → call Bash("ls") or Bash("find ..."). NEVER list files from memory.
+3. To find files by name → call Glob(pattern="**/*keyword*"). To list directory contents → call Glob(pattern="dir/*"). NEVER use Bash("ls") or Bash("find") — always use Glob.
 4. To modify a file → call Edit. To create a new file → call Write.
 5. To run code → call Bash("python ...").
 6. NEVER ask "which file?" or "could you provide?" or "please specify" — use the file tree above to find files yourself. If the user says "the code" without naming a file, read ALL .py files that are not test files.
 7. Use absolute paths: {self.working_dir}/<relative_path>.
 8. If a filename is partial (e.g., "buggy_code"), match it to the closest file in the tree.
+9. NEVER use Bash for file searching. Use Glob for finding files and Grep for searching content. Bash is ONLY for running programs (python, npm, git, etc.).
 
 PROACTIVE FILE DISCOVERY:
-- When user mentions "the code" or "bugs" without specifying a file, you MUST immediately call Read on each non-test .py file ONE BY ONE. Start with buggy_code.py. Do NOT use wildcards or globs — Read only accepts a single file path.
+- When user mentions "the code" or "bugs" without specifying a file, first call Glob(pattern="**/*.py") to find all Python files, then Read each non-test file ONE BY ONE. Start with buggy_code.py.
 - ALWAYS call Read FIRST before analyzing or explaining anything.
+
+SEARCH STRATEGY FOR LARGE CODEBASES (CRITICAL):
+- When working with a large codebase (many files), use a FUNNEL approach:
+  Step 1: Glob(pattern="**/*keyword*") or Glob(pattern="**/*.ext") to find relevant files by name
+  Step 2: Grep(pattern="keyword", path="<dir>") to search file contents
+  Step 3: Read(file_path="<file>", offset=N, limit=50) to read ONLY the specific section you need
+- IMPORTANT: ALWAYS start with Glob to find files. NEVER use Bash("find") or Bash("ls") for file discovery. Glob is faster and returns better results.
+- NEVER paginate through a large file with Read — if you need to find something in a 500+ line file, use Grep(pattern="...", path="<file>") to locate the exact lines first, then Read only those lines.
+- When Read returns "File too large" error, ALWAYS use Grep next (not Read with offset/limit). The error message shows a suggested Grep pattern — use it.
+- After 2-3 Grep calls, you should have enough context to answer. Do NOT read entire files.
+- You have a LIMITED budget of ~10 tool calls. After gathering enough information (usually 5-8 calls), STOP searching and WRITE YOUR ANSWER. Do not keep reading more code — synthesize what you have.
 
 FOLLOW USER INTENT — do exactly what is asked, nothing more, nothing less:
 - "显示/show/read X" → Read, present result. STOP. Do NOT analyze, fix, or run.
@@ -359,8 +403,9 @@ Keep text responses short. Always act first, explain after."""
         self._traj_session_id = traj.session_id
 
         # Circuit Breaker：最大循环轮数
-        # Day 3/4 升级：从 5 → 10，适应任务分解 + 多步执行的更长工作流
-        max_rounds = 10
+        # CC 没有默认轮次上限（靠模型自己 end_turn），但 30B MoE 缺乏自主停止能力，
+        # 需要外部限制。15 轮给 Localization 漏斗（~5 轮）+ 修复验证（~5 轮）留够空间。
+        max_rounds = 15
         round_num = 0
 
         while round_num < max_rounds:
@@ -369,10 +414,25 @@ Keep text responses short. Always act first, explain after."""
             trace(f"══ Round {round_num}/{max_rounds} ══",
                   conversation_len=len(self.conversation))
 
+            # ── Micro Compact（对齐 CC 的 microCompact.ts）──────────
+            # CC 在每轮 API 调用前清理旧工具结果，保护上下文窗口：
+            #   旧的 tool_result → "[Old tool result content cleared]"
+            # 只保留最近 KEEP_RECENT 条消息的完整工具结果。
+            # 这是 CC 七层上下文防线的第 4 层。
+            self._microcompact()
+
             # 构造请求：system prompt + tools + 对话历史
             # system prompt 作为对话的第一条消息
             messages = [{"role": "system", "content": self.get_system_prompt()}]
             messages.extend(self.conversation)
+
+            # 预算警告：倒数第2轮注入合成提示，迫使模型输出答案而非继续搜索
+            # CC 靠模型自己 end_turn，但 30B MoE 需要外部信号触发模式切换
+            if round_num >= max_rounds - 1:
+                messages.append({
+                    "role": "user",
+                    "content": "IMPORTANT: You are running out of rounds. STOP searching and WRITE YOUR FINAL ANSWER NOW based on what you have found so far. Do NOT call any more tools — just summarize your findings in detail."
+                })
 
             # ── 发送请求，接收流式响应 ────────────────────────────
             print(f"\n── Round {round_num}/{max_rounds} ──", flush=True)
@@ -417,13 +477,32 @@ Keep text responses short. Always act first, explain after."""
             has_tool_use = len(tool_use_blocks) > 0
 
             if not has_tool_use:
+                # ── Budget warning round: accept text as final answer ────
+                # On budget-warning rounds, model is explicitly told to write
+                # its answer without tools. Skip nudge — tool names in text
+                # are descriptions (e.g. "CC's Edit tool"), not failed calls.
+                if round_num >= max_rounds - 1:
+                    if thought_parts:
+                        traj.record_response(" ".join(thought_parts))
+                    trace(f"loop exit: budget round final answer")
+                    traj.end_round()
+                    traj.finish()
+                    return None
+
                 # ── Issue 14 兜底：检测模型是否在文本中描述了工具调用 ──
                 # 小模型有时会"假装调工具"——在文本中描述 Edit/Write 操作，
                 # 但不发出 <tool_call> token。检测到时注入一次性纠正提示。
+                # 使用更严格的匹配：要求工具名后跟 ( 或前有动词 call/use/invoke，
+                # 避免 "CC's Edit tool" 之类的描述触发误报。
                 full_text = " ".join(thought_parts)
                 tool_names = [t for t in self.tools.keys()
                               if t in ("Edit", "Write", "Bash", "Grep")]
-                mentioned_tools = [t for t in tool_names if t in full_text]
+                mentioned_tools = []
+                for t in tool_names:
+                    # Match patterns like "Edit(" or "call Edit" or "use Edit" — not "Edit tool"
+                    import re as _re
+                    if _re.search(rf'\b{t}\s*\(', full_text) or _re.search(rf'(?:call|use|invoke|run)\s+{t}\b', full_text):
+                        mentioned_tools.append(t)
 
                 if mentioned_tools and not self._already_nudged:
                     self._already_nudged = True
@@ -463,7 +542,13 @@ Keep text responses short. Always act first, explain after."""
                       tool=tool_name,
                       params=str(tool_input)[:100])
 
-                print(f"\n  🔧 Executing {tool_name}...", flush=True)
+                print(f"\n  🔧 {tool_name}", flush=True)
+                # 打印工具参数（完整显示，方便 demo 观察）
+                for k, v in tool_input.items():
+                    v_str = str(v)
+                    if len(v_str) > 200:
+                        v_str = v_str[:200] + "..."
+                    print(f"     {k}: {v_str}", flush=True)
                 t_tool_0 = _time.time()
                 # Agent 工具需要额外传递 parent_session_id
                 if tool_name == "Agent":
@@ -492,10 +577,17 @@ Keep text responses short. Always act first, explain after."""
                                    sub_session_id=sub_session_id)
 
                 if is_error:
-                    print(f"  ❌ {result}", flush=True)
+                    print(f"  ❌ {result[:500]}", flush=True)
                 else:
-                    preview = result[:80].replace('\n', ' ')
-                    print(f"  ✅ {preview}{'...' if len(result) > 80 else ''}", flush=True)
+                    # 显示更完整的结果（多行保留前 5 行，单行显示 200 字符）
+                    lines = result.split('\n')
+                    if len(lines) <= 5:
+                        for line in lines:
+                            print(f"     {line}", flush=True)
+                    else:
+                        for line in lines[:5]:
+                            print(f"     {line}", flush=True)
+                        print(f"     ... ({len(lines)} lines total)", flush=True)
 
                 # 构造 tool_result block
                 # tool_use_id 关联确保多工具并发时结果不会错配
@@ -632,12 +724,20 @@ Keep text responses short. Always act first, explain after."""
         _tool_markers = ["<tool_call>", "<function=", "```json", "```\n{"]
         # Thinking mode 状态
         _in_thinking = False
+        # 服务端错误
+        _server_error = None
 
         for line in resp.iter_lines(decode_unicode=True):
             if not line or not line.startswith("data: "):
                 continue
 
             data = json.loads(line[6:])  # 去掉 "data: " 前缀
+
+            # 处理服务端错误（如 vLLM context overflow）
+            if "error" in data:
+                _server_error = data["error"]
+                print(f"\n  ❌ Server error: {_server_error}", flush=True)
+                continue
 
             if "thinking" in data:
                 token = data["thinking"]
@@ -706,6 +806,20 @@ Keep text responses short. Always act first, explain after."""
         if _stream_buf and not _in_tool_block:
             print(_stream_buf, end="", flush=True)
 
+        # 服务端报错且无有效响应时，构造一个包含错误信息的 fallback 响应
+        # 这让 ReAct 循环能继续运转——模型看到错误信息后可以调整策略
+        # （如用 offset/limit 读取大文件的局部），而非直接终止会话
+        if claude_response is None and _server_error:
+            claude_response = {
+                "role": "assistant",
+                "content": [{"type": "text", "text":
+                    f"I encountered an error: {_server_error}. "
+                    f"This may be due to the conversation context being too long. "
+                    f"I should try using more targeted tool calls "
+                    f"(e.g., Read with offset/limit for large files)."}],
+                "stop_reason": "end_turn"
+            }
+
         return claude_response
 
     def _execute_tool(self, tool_name: str, parameters: Dict[str, Any]) -> str:
@@ -731,6 +845,56 @@ Keep text responses short. Always act first, explain after."""
             return tool.execute(**parameters)
         except Exception as e:
             return f"Error executing {tool_name}: {str(e)}"
+
+    # ── Micro Compact（对齐 CC 的 microCompact.ts）───────────────────
+    # 保留最近 N 条消息的完整工具结果，清理更早的
+    KEEP_RECENT_MESSAGES = 3
+
+    def _microcompact(self):
+        """
+        清理旧的工具结果，保护上下文窗口。
+
+        对齐 CC 的 microCompact.ts：
+            CC 在每轮 API 调用前，将旧的 tool_result 内容替换为
+            "[Old tool result content cleared]"，只保留最近 N 条消息的
+            完整工具结果。这是 CC 七层上下文防线的第 4 层。
+
+        为什么这有效？
+            工具结果（尤其是 Read 和 Bash 的输出）是上下文中最大的消费者。
+            模型在前几轮读取的文件内容对后续推理的价值递减——
+            它已经从中提取了 Thought，不需要原始内容了。
+            清理旧结果释放上下文空间，让后续推理不会因 token 溢出而崩溃。
+
+        设计决策：
+            - 只清理 tool_result block 的 content 字段（保留 block 结构）
+            - 保留 assistant 的 text（Thought）和 tool_use block（Action 记录）
+            - 保留 user 的 text block（intent reminder 等）
+            - 保留最近 KEEP_RECENT_MESSAGES 条消息不动
+        """
+        if len(self.conversation) <= self.KEEP_RECENT_MESSAGES:
+            return
+
+        compacted = 0
+        # 只清理前面的消息，保留最近 N 条不动
+        cutoff = len(self.conversation) - self.KEEP_RECENT_MESSAGES
+        for msg in self.conversation[:cutoff]:
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if (isinstance(block, dict)
+                        and block.get("type") == "tool_result"
+                        and isinstance(block.get("content"), str)
+                        and len(block["content"]) > 200):
+                    block["content"] = "[Old tool result content cleared]"
+                    compacted += 1
+
+        if compacted > 0:
+            trace(f"microcompact: cleared {compacted} old tool results",
+                  conversation_len=len(self.conversation),
+                  cutoff=cutoff)
 
     def reset(self):
         """
