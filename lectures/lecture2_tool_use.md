@@ -593,15 +593,15 @@ adapter 在入口方向做两件事：
 
 每一层 fallback 都会先跑 `_sanitize_json()` 修复常见畸变（去注释、删尾逗号、转三引号），然后尝试解析。只有当上一层全部失败时才尝试下一层。
 
-### 实战教训：Qwen2.5 vs Qwen3 的格式差异
+### 实战教训：从 Qwen2.5 迁移到 Qwen3 的格式差异
 
-一个我们刚刚经历的真实案例：
+我们在迁移演示模型时经历的一个真实案例：
 
 Qwen2.5-Coder 使用 **hermes 格式**：`<tool_call>{"name":"Read","arguments":{...}}</tool_call>`
 
 Qwen3-Coder 使用 **XML 格式**：`<function=Read><parameter=file_path>...</parameter></function>`
 
-当我们用 Qwen3-Coder-30B-A3B（MoE 模型）替换 Qwen2.5-Coder-7B 时，vLLM 的 tool-call-parser 还在用 `hermes`。hermes parser 在 streaming 模式下会拦截 `<tool_call>` 标签——但 Qwen3 的输出里没有这个标签，而是 `<function=Read>` XML 格式。结果：hermes parser 拦截了模型输出但无法解析，导致 **content 被吞掉，streaming 返回空内容**。
+当我们用 Qwen3-30B-A3B（MoE 模型）替换 Qwen2.5-Coder-7B 时，vLLM 的 tool-call-parser 还在用 `hermes`。hermes parser 在 streaming 模式下会拦截 `<tool_call>` 标签——但 Qwen3 的输出里没有这个标签，而是 `<function=Read>` XML 格式。结果：hermes parser 拦截了模型输出但无法解析，导致 **content 被吞掉，streaming 返回空内容**。
 
 从用户视角看到的现象是：Agent 第一轮 Read 成功后，第二轮"No response from model"——看起来像是模型崩了，实际上是 parser 选错了。
 
@@ -722,9 +722,9 @@ for i, text in enumerate([text1, text2, text3], 1):
 
 **关键观察**：前沿模型几乎 100% 输出格式 1。但小模型可能输出三种格式中的任意一种，甚至输出更畸形的变体（带 JS 注释、Python 三引号等）。parser 的四层 fallback 就是在用工程手段弥补小模型的格式可靠性不足——这是选择路线 A（结构化工具集）时必须承担的工程成本。
 
-**Part C：Qwen2.5 vs Qwen3 格式差异（如有两个模型可用）**
+**Part C：Qwen2.5 → Qwen3 格式差异（迁移案例）**
 
-如果同时部署了两个模型，展示同一个 prompt 在两个模型上的原始输出差异：
+展示同一个 prompt 在两代模型上的原始输出差异：
 
 ```
 Qwen2.5: <tool_call>{"name":"Read","arguments":{"file_path":"..."}}</tool_call>
