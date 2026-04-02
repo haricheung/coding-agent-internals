@@ -339,14 +339,14 @@ Lead 收到两个报告 → ReadInbox()
   Lead 发现端口 bug → spawn 修复 Worker → 交付
 
 Live 部分（2 分钟）：
-  用 MVP + Qwen2.5-Coder-7B 演示单个 backend-dev Worker
+  用 MVP + Qwen3-30B-A3B 演示单个 backend-dev Worker
   执行子任务。观察：
   - Worker 的受限工具集（只有 Read/Write/Edit/Grep/Bash）
   - Worker 的独立上下文（看不到 Lead 的对话历史）
   - Worker 完成后 SendMessage 回报
 
 可选演示：
-  让 7B 充当 Lead 尝试分解任务，
+  让小模型充当 Lead 尝试分解任务，
   观察其力不从心——任务分解不合理、Worker prompt 模糊。
   引出：编排需要强模型，执行可以用弱模型。
   "10 个实习生 + 1 个好的项目经理 = 高效团队；
@@ -393,7 +393,7 @@ Anthropic 官方明确：多 Agent 系统消耗 3-10x token，总执行时间可
 
 **2. 协调原语工具化 = LLM 运行时自主编排**
 
-CC 的创新不在某个单一工具，而在于把 TeamCreate、TaskCreate、Agent、SendMessage **全部做成工具**，让 LLM 自己决定编排策略——没有固定 SOP（MetaGPT）、没有自由对话（AutoGen）、没有硬编码 Controller（OpenHands）。harness 提供能力（工具），model 提供智能（何时用、怎么用）。风险：这要求编排者是强模型——7B 模型做 Lead 力不从心，但做 Worker 绰绰有余。
+CC 的创新不在某个单一工具，而在于把 TeamCreate、TaskCreate、Agent、SendMessage **全部做成工具**，让 LLM 自己决定编排策略——没有固定 SOP（MetaGPT）、没有自由对话（AutoGen）、没有硬编码 Controller（OpenHands）。harness 提供能力（工具），model 提供智能（何时用、怎么用）。风险：这要求编排者是强模型——小模型做 Lead 力不从心，但做 Worker 绰绰有余。
 
 **3. Boyd 推论三的实证：少通信 > 多通信**
 

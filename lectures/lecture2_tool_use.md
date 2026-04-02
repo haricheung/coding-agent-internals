@@ -455,7 +455,7 @@ Context Budget 分配（每轮）：
 
 > **CC 源码实证**（`ToolSearchTool/ToolSearchTool.ts`）：CC 用 **ToolSearch 延迟加载**解决了这个 trade-off。50+ 个工具中，只有 ~9 个核心工具（Read, Edit, Write, Grep, Glob, Bash, Agent, Skill, Brief）的 schema 始终随请求发送。其余 25+ 个工具标记为 `shouldDefer: true`，不占初始 prompt token。模型需要时先调用 ToolSearch 发现并加载目标工具，再执行调用。这是"按需加载"思想在 tool schema 层面的应用——用一次额外的工具调用换取每轮 ~5K tokens 的 context 节省。
 
-随着模型越强（生成越可靠）+ context window 越大（token 越便宜），路线 A 的优势越明显。但在小模型 + 短 context 的场景（比如我们的 MVP 用 7B 模型 + 16K context），这个 trade-off 需要认真权衡。
+随着模型越强（生成越可靠）+ context window 越大（token 越便宜），路线 A 的优势越明显。但在小模型 + 短 context 的场景（比如我们的 MVP 用 MoE 模型 + 32K context），这个 trade-off 需要认真权衡。
 
 ---
 
@@ -547,11 +547,11 @@ adapter 在入口方向做两件事：
 在出口方向做一件事：
 3. **qwen_response_to_claude()**：将 Qwen 的原始文本输出（含 `<tool_call>` 标签）解析为 Claude 的 typed content blocks
 
-**Anthropic 的 API 基础设施也在做完全相同的事**——只不过 Anthropic 用前沿模型（几乎不出格式错）+ 约束解码（确定性保证），我们用 7B/30B 模型（可能出格式错）+ 鲁棒解析（概率性兜底）。
+**Anthropic 的 API 基础设施也在做完全相同的事**——只不过 Anthropic 用前沿模型（几乎不出格式错）+ 约束解码（确定性保证），我们用小模型（可能出格式错）+ 鲁棒解析（概率性兜底）。
 
 ### 小模型的格式可靠性问题：parser.py 的四层 fallback
 
-前沿模型生成工具调用格式几乎 100% 正确。但 7B 模型不行——它会犯各种格式错误：
+前沿模型生成工具调用格式几乎 100% 正确。但小模型不行——它会犯各种格式错误：
 
 ```
 错误 1：用代码块包裹而非 XML 标签
@@ -575,7 +575,7 @@ adapter 在入口方向做两件事：
         pass"""}
 ```
 
-这就是小模型使用结构化工具集的代价——**格式可靠性不足**。前沿模型几乎 100% 生成正确的 JSON 工具调用格式，但 7B 模型会犯各种格式错误。我们用 `parser.py` 的四层 fallback 策略来应对：
+这就是小模型使用结构化工具集的代价——**格式可靠性不足**。前沿模型几乎 100% 生成正确的 JSON 工具调用格式，但小模型会犯各种格式错误。我们用 `parser.py` 的四层 fallback 策略来应对：
 
 ```
 策略 1：XML 标签（最可靠，Qwen 原生格式的主路径）
@@ -720,7 +720,7 @@ for i, text in enumerate([text1, text2, text3], 1):
     print(f"格式 {i}: {result}")  # 三种格式都解析出 ToolCall(Read, {file_path: ...})
 ```
 
-**关键观察**：前沿模型几乎 100% 输出格式 1。但 7B 模型可能输出三种格式中的任意一种，甚至输出更畸形的变体（带 JS 注释、Python 三引号等）。parser 的四层 fallback 就是在用工程手段弥补小模型的格式可靠性不足——这是选择路线 A（结构化工具集）时必须承担的工程成本。
+**关键观察**：前沿模型几乎 100% 输出格式 1。但小模型可能输出三种格式中的任意一种，甚至输出更畸形的变体（带 JS 注释、Python 三引号等）。parser 的四层 fallback 就是在用工程手段弥补小模型的格式可靠性不足——这是选择路线 A（结构化工具集）时必须承担的工程成本。
 
 **Part C：Qwen2.5 vs Qwen3 格式差异（如有两个模型可用）**
 
@@ -737,7 +737,7 @@ Qwen3:   <function=Read><parameter=file_path>...</parameter></function>
 
 ### 当演示"失败"：Harness 的兜底与 Reflexion 的雏形
 
-用 7B 模型做现场演示，模型大概率不会每次都完美输出工具调用格式。这些"失败"恰好展示了 harness 在整个系统中的核心地位——**模型可以犯错，但 harness 不能放弃。**
+用小模型做现场演示，模型大概率不会每次都完美输出工具调用格式。这些"失败"恰好展示了 harness 在整个系统中的核心地位——**模型可以犯错，但 harness 不能放弃。**
 
 三种典型失败场景及 harness 的应对：
 
