@@ -162,6 +162,34 @@ Haiku 4.5: +36.7%
 
 这也回答了一个实践问题：**如果你在用弱模型做 Agent（成本考虑），花时间优化 harness 的 ROI 比换更强的模型更高。**
 
+### CC 自身的 Harness 旋钮：同一模型的多档调节
+
+Meta-Harness 论文说"改变 harness 可产生 6 倍性能差距"。CC 的源码提供了一个更贴近日常的实证：**即使不改 harness 代码，仅调整运行时参数，同一个模型的行为也会显著不同。**
+
+> **CC 源码实证**（`cli.js`）：CC 暴露了两个关键的 harness 旋钮：
+>
+> **旋钮一：Effort Level（思考强度）**
+>
+> | 级别 | 效果 | 适用场景 |
+> |------|------|---------|
+> | `low` | 快速回答，浅层推理 | 简单查询 |
+> | `medium` | 默认平衡 | 日常编码 |
+> | `high` | 深度推理，更长 thinking | 复杂 bug 修复 |
+> | `max` | 最深推理（仅 Opus 4.6） | 架构决策、困难问题 |
+>
+> 同一个 Opus 4.6 模型，`low` effort 可能 1 轮完成简单任务，`max` effort 则会在 thinking 阶段花更多 token 做深度分析。**Effort level 本质上是 harness 控制模型在 Orient 环节投入多少推理资源**——对应 Boyd 框架中"每轮 OODA 的深度 vs 整体循环的速度"的 trade-off。
+>
+> **旋钮二：Fast Mode（速度 vs 成本）**
+>
+> | 模式 | Input 价格 | Output 价格 | 效果 |
+> |------|:---:|:---:|------|
+> | Normal Opus 4.6 | $5/M | $25/M | 标准速度 |
+> | Fast Opus 4.6 | $30/M | $150/M | 更快输出（同一模型，6x 价格） |
+>
+> Fast mode 不是换模型——是同一个 Opus 4.6，用 6 倍价格换更快的 token 生成速度。这直接对应 Boyd 的"循环转速"：**付更多钱让每轮 OODA 跑得更快，整体循环转速提升**。当 fast mode 遇到 429 rate limit 时，CC 自动 cooldown 降回普通模式——harness 在运行时动态调节速度/成本平衡。
+>
+> 这两个旋钮共同说明：**harness 不只是静态的代码，也包括运行时的参数调节**。Meta-Harness 论文搜索优化的是 harness 代码（system prompt、工具设计），但 effort level 和 fast mode 展示了另一个优化维度——运行时配置。完整的 harness 工程包括两者。
+
 ---
 
 ## 双主线回顾

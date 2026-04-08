@@ -369,6 +369,15 @@ Agentless 的实战表现验证了这个思路：在 SWE-bench Lite 上，它用
 
 Claude Code 选择了路线 A。接下来我们深入看它的具体设计。
 
+> **CC 源码实证**（`src/services/tools/toolOrchestration.ts`，行 19-82）：CC 的工具执行不是简单的串行——它对**只读工具**和**写工具**做了不同处理：
+>
+> - **只读工具（Glob, Grep, Read, LSP 等）**：**并发执行**，最多同时 10 个。模型在一条消息中可以同时调用多个搜索工具，它们并行运行，结果一起返回
+> - **写工具（Edit, Write, Bash 等）**：**严格串行**。哪怕模型在同一条消息中发出了 3 个 Edit 调用，harness 也会逐个执行
+>
+> 这个设计的原因是**文件系统一致性**：两个并行 Edit 可能修改同一个文件，导致 search/replace 的 old_string 匹配失败。只读操作没有副作用，并行执行完全安全，且能显著加速 Localization 阶段。
+>
+> 对比 CodeAct 路线：一段 Python 代码可能同时包含读和写操作（`content = open("a").read(); open("b","w").write(content)`），harness 无法拆分其中的读写依赖——只能整体串行执行，丧失了并行加速 Observe 的机会。
+
 ---
 
 ## 2.3 Claude Code 的工具集：少即是多

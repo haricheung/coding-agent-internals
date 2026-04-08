@@ -254,7 +254,90 @@ OpenHands 走了更彻底的路线——为每个 Agent 提供独立的 Docker s
 
 ---
 
-## 6.5 编队 OODA：嵌套循环
+## 6.5 模型路由：编排用强模型，执行用弱模型
+
+Agent Team 中自然产生了一个模型选择问题：Lead 和 Worker 需要用同一个模型吗？直觉上，Lead 负责任务拆解和质量评估——这是高认知负荷的工作，需要强模型；Worker 负责在明确范围内写代码——这是执行性工作，弱模型即可胜任。
+
+CC 的源码证实了这一直觉，并且把模型路由做成了一套**确定性分发规则**——不是"智能判断何时该用哪个模型"，而是基于订阅层级 + 用户配置 + 任务类型的三层路由。
+
+### 默认模型选择：按订阅 tier 分级
+
+> **CC 源码实证**（`cli.js`，`DN()` 函数）：默认模型的选择逻辑非常简单——Max 和 Team-5x 用户默认 Opus 4.6，其余所有用户默认 Sonnet 4.6。没有动态判断，没有任务分析，纯粹按订阅层级一刀切。
+>
+> ```
+> DN() {
+>   if (isClaudeMax())       → Opus 4.6 (+ optional 1M context)
+>   if (isTeamMax5x())       → Opus 4.6
+>   return Sonnet 4.6        ← 所有其他用户的默认
+> }
+> ```
+
+### Sub-Agent 模型继承：默认跟随父模型
+
+> **CC 源码实证**（`cli.js`，`JE6()` 函数）：Agent tool 的 `model` 参数默认值是 `"inherit"`——子 Agent 继承父 Agent 的主循环模型。用户可以通过 `model: "haiku"` / `model: "sonnet"` / `model: "opus"` 显式指定子 Agent 使用不同层级的模型。
+>
+> ```
+> JE6(requestedModel, mainLoopModel, override, permissionMode) {
+>   if (CLAUDE_CODE_SUBAGENT_MODEL env) → 强制使用环境变量指定的模型
+>   if (requestedModel == null)         → "inherit" → 继承父模型
+>   if (requestedModel == "haiku")      → 解析为 Haiku 4.5
+>   if (requestedModel == "opus")       → 解析为 Opus 4.6
+>   ...
+> }
+> ```
+>
+> 这意味着 CC 当前的默认行为是 **Lead 和 Worker 用同一个模型**。但 `model` 参数的存在为"强 Lead + 弱 Worker"模式留了接口——用户可以手动指定 Worker 用 Haiku，Lead 继续用 Opus。
+
+### `opusplan` 模式：规划用 Opus，执行用 Sonnet
+
+> **CC 源码实证**（`cli.js`，`hu()` 函数）：CC 有一个专门的 `opusplan` 别名，在 plan 模式下用 Opus 做深度推理，其余时段自动降级到 Sonnet：
+>
+> ```
+> hu({ permissionMode, mainLoopModel }) {
+>   if (override == "opusplan" && mode == "plan")
+>     return Opus 4.6     // plan 阶段：深度思考
+>   if (override == "haiku" && mode == "plan")
+>     return Sonnet 4.6   // haiku 用户在 plan 模式自动升级
+>   return mainLoopModel  // 执行阶段：保持原模型
+> }
+> ```
+>
+> `opusplan` 的设计哲学正是"规划用强模型，执行用弱模型"的工程化实现。花 $5/M tokens 的 Opus 做任务拆解和架构决策（高认知负荷，token 少），花 $3/M tokens 的 Sonnet 做代码编写和文件操作（低认知负荷，token 多），**整体成本接近纯 Sonnet，但规划质量接近纯 Opus**。
+
+### Haiku 的专属角色：轻量辅助任务
+
+> **CC 源码实证**（`cli.js`，`EJ()` 函数）：Haiku 4.5 **不参与主对话循环**，专门用于轻量辅助任务：
+>
+> | 使用场景 | 模型 | 成本 |
+> |---------|------|------|
+> | Hook prompt 回调处理 | Haiku 4.5 | $1/M |
+> | WebFetch 内容摘要 | Haiku 4.5 | $1/M |
+> | Web search 结果处理 | Haiku 4.5 | $1/M |
+> | 轻量 verification | Haiku 4.5 | $1/M |
+> | 主循环（默认） | Sonnet 4.6 | $3/M |
+> | 主循环（Max 用户） | Opus 4.6 | $5/M |
+>
+> 这是一个三层模型金字塔：**Opus 做规划、Sonnet 做执行、Haiku 做杂活**——每一层匹配对应的认知负荷和成本预算。
+
+### 对 Agent Team 设计的启示
+
+CC 的模型路由揭示了一个工程原则：**模型选择不是全局统一的决策，而是按任务角色分级的分发策略。** 这和我们在 §6.1 讨论的"什么时候需要 Agent Team"是同一个问题的不同侧面——不仅上下文可以按角色隔离，**模型能力也应该按角色匹配**：
+
+```
+模型金字塔 × 角色匹配：
+
+  Opus 4.6   ─── Lead / Planner（任务拆解、质量评估、架构决策）
+      │
+  Sonnet 4.6 ─── Worker（代码编写、文件操作、测试执行）
+      │
+  Haiku 4.5  ─── Utility（内容摘要、格式校验、hook 回调）
+```
+
+回到 Demo 6 的可选演示——"编排需要强模型，执行可以用弱模型"——CC 的 `opusplan` 设计是这个论点的工业级实证：Anthropic 自己就认为规划和执行的认知负荷不同，值得用不同模型承担。
+
+---
+
+## 6.6 编队 OODA：嵌套循环
 
 回到第一讲 Boyd 推论三：**协调开销决定编队 OODA 的上限。**
 
@@ -286,7 +369,7 @@ Meta-Validation：  Lead 汇总结果 → 运行集成测试 → 检查跨模块
 
 ---
 
-## 6.6〔Demo 6 · 预录+Live 混合〕Agent Team 构建 Todo 服务
+## 6.7〔Demo 6 · 预录+Live 混合〕Agent Team 构建 Todo 服务
 
 用一个真实的 Todo Web 应用构建任务，展示 Agent Team 的完整协作流程。这个任务已经在 MVP 上成功跑通（trajectory: `session_20260330_201732.json`），Lead 甚至发现了一个跨模块 bug。
 
@@ -355,7 +438,7 @@ Live 部分（2 分钟）：
 
 ---
 
-## 6.7 本节小结：从单体到编队的 OODA 演进
+## 6.8 本节小结：从单体到编队的 OODA 演进
 
 回到认知地图，本节将视角从单 Agent 扩展到多 Agent 编队——至此，课程的全部内容模块覆盖完毕：
 

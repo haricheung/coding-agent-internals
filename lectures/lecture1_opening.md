@@ -145,6 +145,50 @@ TAO 将 OODA 的 Orient（理解）和 Decide（决策）压缩为一个 Thought
 
 这一发现对工程实践的指导意义是：**投入一倍的精力优化提示词（提升"模型能力"），不如投入一倍的精力优化 Agent 循环机制（提升"系统节奏"）。** 这正是 Claude Code 的核心设计理念——它的竞争力不在于 Claude 模型比其他模型强多少（虽然确实强），而在于整个 Agent 系统的循环机制设计得多好。
 
+> **CC 源码实证**（`src/constants/prompts.ts`，~915 行）：CC 的 system prompt 不是一整段文本，而是**分段组装**的工业结构。它分为两大块，中间由 `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` 标记分界：
+>
+> | 段位 | 内容 | 是否可缓存 |
+> |------|------|:---:|
+> | **静态段**（分界线之前） | | |
+> | 1. Identity + Safety | 身份声明、安全指令 | ✓ |
+> | 2. System Section | 输出渲染、权限模式、hooks | ✓ |
+> | 3. Doing Tasks | 编码行为规则（先读后改、不镀金） | ✓ |
+> | 4. Actions | 可逆性/爆炸半径，危险操作清单 | ✓ |
+> | 5. Using Tools | 工具使用指令（用 Read 不用 cat） | ✓ |
+> | 6. Tone & Style | 不用 emoji、简洁 | ✓ |
+> | 7. Output Efficiency | "Go straight to the point" | ✓ |
+> | **动态段**（分界线之后） | | |
+> | 8. Agent/Skill 指导 | Agent tool 参数、skill 列表 | ✗ |
+> | 9. Auto-memory | 记忆系统提示 | ✗ |
+> | 10. Environment | CWD、git status、platform、model | ✗ |
+>
+> **分界线的工程意义**：Anthropic API 的 prompt cache 只对 `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` 之前的静态段生效。静态段在所有会话中不变（~5K tokens），一次缓存后续复用——**每轮 API 调用可节省 ~5K tokens 的重复输入成本**。动态段（CWD、git status 等）每次会话不同，无法缓存。
+>
+> 这个设计揭示了 harness 工程的一个常被忽视的维度：**不只是 prompt 说什么重要，prompt 的组织结构也直接影响成本**。把"不变的行为规则"放前面（利用缓存），"变化的环境信息"放后面——这是一个纯工程层面的优化，与模型能力无关，但对多轮循环中的累积成本影响很大。
+
+### LLM 与 Harness 的分工
+
+理解了 ReAct 循环和 system prompt 架构之后，一个自然的问题是：**在整个 Agent 系统中，LLM 到底负责什么，工程代码（harness）又负责什么？**
+
+很多人直觉上认为"Agent 的能力 ≈ 模型的能力"。但从 CC 的源码可以看到，模型只负责系统中"需要智能"的部分，大量关键工作由 harness 代码完成——模型甚至不知道这些工作的存在。
+
+| OODA 环节 | LLM 负责（需要智能） | Harness 负责（纯工程） |
+|-----------|-------------------|---------------------|
+| **Observe** | 理解工具返回的内容，识别关键信息 | 执行工具、截断过长输出、控制信息粒度（Read 的 offset/limit） |
+| **Orient** | 从观察中推理，形成假设（"87.5=350/4，除数错了"） | 触发上下文压缩、保留关键失败经验（compact 第 4 段） |
+| **Decide** | 选择下一步行动，决定调用哪个工具、传什么参数 | — |
+| **Act** | 生成结构化的工具调用（tool_use JSON） | 解析 JSON、权限检查、真实执行、格式化返回结果 |
+| **循环控制** | 判断任务是否完成（`end_turn`） | 12 个退出点、7 个继续点、max_turns 硬限制 |
+| **记忆管理** | 生成压缩摘要（auto-compact 的 9 段结构） | 决定何时触发压缩、注入恢复文件、熔断失败重试 |
+| **安全边界** | —（模型不知道权限系统的存在） | 7 种权限模式、8 个规则来源、Hook 系统 |
+| **Prompt 工程** | —（模型不知道自己的 prompt 是怎么来的） | 分段组装、缓存优化、动态注入环境信息 |
+
+**Decide 是 LLM 唯一独占的环节**——harness 不参与决策。其他所有环节都是 LLM 与 harness 的协作，甚至有两个环节（安全边界、Prompt 工程）LLM 完全不参与。
+
+这张表揭示了一个容易被忽视的事实：**Agent 系统中超过一半的关键工作是纯工程代码完成的，模型甚至不知道它们的存在。** CC 的 `queryLoop()` 有 1488 行（第五讲会详细拆解），其中模型能"感知"到的只是每轮的 tool_use → tool_result 交互——循环控制、上下文压缩、权限检查、错误恢复全部在幕后发生。
+
+这也是为什么 Boyd 推论一说"基础能力是门槛，循环机制是放大器"——LLM 提供智能，harness 提供结构。**同一个 LLM，放在不同的 harness 里，表现可以相差 6 倍**（Meta-Harness 论文的结论，加餐环节会展开）。整门课程拆解的每一个部件——system prompt、工具设计、上下文管理、循环控制、协同编排、安全机制——都是 harness 的组成部分。
+
 ---
 
 ## 1.4 Demo 1 演示：同一个 Bug，两种修复方式

@@ -409,7 +409,118 @@ Pick up mid-thought if that is where the cut happened. Break remaining work into
 
 ---
 
-## 10. 与课程/MVP 的对照总结
+## 10. 模型路由与分级
+
+**文件**: `/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js`（v2.1.92，minified/bundled）
+
+### 10.1 模型目录（`Di` 对象）
+
+CC 内部定义了完整的模型目录，每个模型有多 provider ID 映射：
+
+| 内部别名 | firstParty ID | 定价（per M tokens, input/output） |
+|---------|---------------|-------------------------------|
+| `opus46` | `claude-opus-4-6` | $5 / $25（普通），$30 / $150（fast mode） |
+| `sonnet46` | `claude-sonnet-4-6` | $3 / $15 |
+| `haiku45` | `claude-haiku-4-5-20251001` | $1 / $5 |
+
+还包括旧版模型（opus40/41/45, sonnet35/37/40/45, haiku35），以及 bedrock/vertex/foundry 等第三方 provider 的 ID 映射。
+
+### 10.2 默认模型选择（`DN()` 函数）
+
+```
+DN() {
+  if (KC())    // Claude Max 订阅
+    return fN() + (yJ() ? "[1m]" : "")   // Opus 4.6 + optional 1M context
+  if (Y16())   // Team plan with max-5x tier
+    return fN() + (yJ() ? "[1m]" : "")   // Opus 4.6
+  return nT()  // Sonnet 4.6（所有其他用户）
+}
+```
+
+**只有 Max 和 Team-5x 用户默认 Opus，其余全部默认 Sonnet 4.6。**
+
+三层 Override 优先级（`qC()` 函数）：`runtime override > ANTHROPIC_MODEL env > settings.json model`
+
+### 10.3 别名解析（`y5()` 函数）
+
+| 别名 | 解析为 |
+|------|-------|
+| `"opus"` | `fN()` → Opus 4.6 |
+| `"sonnet"` | `nT()` → Sonnet 4.6 |
+| `"haiku"` | `l06()` → Haiku 4.5 |
+| `"best"` | `fN()` → Opus 4.6 |
+| `"opusplan"` | `nT()` → Sonnet 4.6（注意：非 plan 模式时解析为 Sonnet） |
+
+支持 `[1m]` 后缀启用 1M context window（如 `"opus[1m]"`）。
+
+### 10.4 Sub-Agent 模型选择（`JE6()` 函数）
+
+```
+JE6(requestedModel, mainLoopModel, override, permissionMode) {
+  if (CLAUDE_CODE_SUBAGENT_MODEL env) → 强制使用
+  if (override exists && same family as main) → 使用主模型
+  if (requestedModel == null) → "inherit" → 继承父模型（via hu()）
+  if (requestedModel same family as main) → 使用主模型
+  else → y5(requestedModel) 解析别名
+}
+```
+
+默认 `"inherit"`：子 Agent 继承父 Agent 的主循环模型。`Ym4()` 函数检查请求的别名是否与主模型同 family，避免重复解析。
+
+### 10.5 Plan 模式模型调整（`hu()` 函数）
+
+```
+hu({ permissionMode, mainLoopModel, exceeds200kTokens }) {
+  if (override == "opusplan" && mode == "plan" && !exceeds200k)
+    return Opus 4.6       // plan 模式用 Opus
+  if (override == "haiku" && mode == "plan")
+    return Sonnet 4.6     // haiku 在 plan 模式自动升级
+  return mainLoopModel    // 其他情况保持原模型
+}
+```
+
+`opusplan` 的设计：plan 阶段用 Opus 做深度推理（高认知负荷，少 token），执行阶段自动降级为 Sonnet（低认知负荷，多 token）。
+
+### 10.6 Haiku 专属用途——"Small Fast Model"（`EJ()` 函数）
+
+```
+EJ() = process.env.ANTHROPIC_SMALL_FAST_MODEL || Haiku 4.5
+```
+
+Haiku **不参与主对话循环**，专门用于轻量任务：hook prompt 回调、WebFetch 内容摘要、web search 结果处理、轻量 verification agents。
+
+### 10.7 Fast Mode（内部代号 "penguin"）
+
+- **条件**: Opus 4.6 + firstParty API + 未被 org 禁用
+- **效果**: 添加 `fast-mode-2026-02-01` beta header
+- **定价**: 6 倍普通 Opus 4.6 价格（$30/$150 vs $5/$25）
+- **限制**: 429 rate limit 时自动 cooldown 回退到普通模式
+- **本质**: 同一个 Opus 4.6 模型，6 倍价格换更快输出速度，不是换模型
+
+`NJ()` 函数检查模型是否为 `opus-4-6`——Fast mode 仅 Opus 4.6 可用。
+
+### 10.8 Effort Level
+
+仅 Opus 4.6 和 Sonnet 4.6 支持。`"max"` effort 仅 Opus 4.6 可用。有效值：`"low"` / `"medium"` / `"high"` / `"max"`。
+
+### 10.9 关键环境变量
+
+| 变量 | 效果 |
+|------|------|
+| `ANTHROPIC_MODEL` | 覆盖默认模型 |
+| `ANTHROPIC_DEFAULT_OPUS_MODEL` | 覆盖 `"opus"` 别名解析目标 |
+| `ANTHROPIC_DEFAULT_SONNET_MODEL` | 覆盖 `"sonnet"` 别名解析目标 |
+| `ANTHROPIC_DEFAULT_HAIKU_MODEL` | 覆盖 `"haiku"` 别名解析目标 |
+| `ANTHROPIC_SMALL_FAST_MODEL` | 覆盖轻量任务模型（默认 Haiku） |
+| `CLAUDE_CODE_SUBAGENT_MODEL` | 强制所有子 Agent 使用指定模型 |
+| `CLAUDE_CODE_DISABLE_FAST_MODE` | 禁用 Fast mode |
+| `CLAUDE_CODE_EFFORT_LEVEL` | 设置 effort level |
+
+**课程启示**：CC 的模型路由是"编排需要强模型，执行可以用弱模型"的工业级实证。`opusplan` 模式、sub-agent `model` 参数、Haiku 专属轻量任务——三层金字塔设计揭示了一个原则：模型选择不是全局统一的决策，而是按任务角色分级的分发策略。
+
+---
+
+## 11. 与课程/MVP 的对照总结
 
 ### 课程论点验证
 
@@ -422,6 +533,7 @@ Pick up mid-thought if that is where the cut happened. Break remaining work into
 | 工具名即权限标签 | 完全确认，支持内容级规则 `Bash(git *)` | 增强论据 |
 | Adapter 层 | CC 不需要（直连 Claude API），MVP 特有 | 无需调整 |
 | Subagent = 新 API 调用 | 完全确认 + Fork/Teammate 两种优化路径 | 可选扩展 |
+| 编排用强模型，执行用弱模型 | `opusplan` + sub-agent `model` 参数 + Haiku 轻量任务 | 三层金字塔实证 |
 
 ### MVP 改进建议
 

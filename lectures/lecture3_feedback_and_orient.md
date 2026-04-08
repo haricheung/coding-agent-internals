@@ -409,7 +409,11 @@ CC 源码（`query.ts`，1400+ 行）中的恢复机制不是"一个 circuit bre
 
 **第二层：行为检测与纠正（干预）**
 - **Nudge 机制**：当模型 end_turn 但任务未完成时，注入引导消息（"你还没完成，继续"）
-- **max_output_tokens 恢复**：模型输出被截断时，注入 "Resume directly — no apology, no recap. Pick up mid-thought."（`query.ts` 行 1188-1256），最多重试 3 次
+- **max_output_tokens 恢复**：模型输出被截断时，CC 注入一条精确的恢复指令。CC 源码中的原文（`query.ts` 行 1230-1236）：
+
+  > *"Output token limit hit. Resume directly -- no apology, no recap of what you were doing. Pick up mid-thought if that is where the cut happened. Break remaining work into smaller pieces."*
+
+  这条消息的每个词都是有意设计的：**"no apology"** 防止模型浪费 token 说"抱歉我被截断了"；**"no recap"** 防止模型复述刚才的内容（最常见的 token 浪费）；**"pick up mid-thought"** 允许从句子中间继续；**"break into smaller pieces"** 引导模型调整策略避免再次被截断。最多重试 3 次（`MAX_MAX_OUTPUT_TOKEN_RECOVERY = 3`），第一次截断时还会升级到 64K max_output_tokens（`ESCALATED_MAX_TOKENS`）
 - **MVP 对应**：我们 `client.py` 的 nudge 机制（检测模型"假装调工具"但没发出 tool_call）
 
 **第三层：强制终止（止损）**
