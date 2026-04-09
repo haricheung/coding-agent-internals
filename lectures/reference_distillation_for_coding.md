@@ -36,9 +36,11 @@
 
 用 Evol-Instruct 让 GPT-4 迭代进化编码问题，再微调 StarCoder/Code Llama。WizardCoder-33B-V1.1 HumanEval 79.9%，一度超越 GPT-3.5-turbo。证明**数据质量 > 数据数量**。
 
-### 2.3 Qwen2.5-Coder（阿里，2024）
+### 2.3 Qwen-Coder 系列（阿里，2024-2025）
 
-5.5 万亿 token 代码预训练，多阶段流水线（通用预训练 → 代码继续预训练 → 指令微调）。小模型利用大模型蒸馏。Qwen2.5-Coder-1.5B 超过许多更大模型，是当前蒸馏实验最合适的 base model 之一。
+**Qwen2.5-Coder（2024）：** 5.5 万亿 token 代码预训练，多阶段流水线（通用预训练 → 代码继续预训练 → 指令微调）。小模型利用大模型蒸馏。Qwen2.5-Coder-7B 仍是 QLoRA 快速验证的经济选择。
+
+**Qwen3-Coder（2025.07）：** MoE 480B 总参 / 36B 激活，Apache 2.0 开源。SWE-bench Verified 70.0%，Aider Polyglot 64.4%。虽已被 2026 年模型超越，但作为**开源 teacher 模型**仍有价值——Apache 2.0 许可无蒸馏限制，且 MoE 架构推理成本可控。
 
 ### 2.4 OpenCoder（2024 末）
 
@@ -182,17 +184,21 @@
 
 ### 6.2 数据许可合规（红线）
 
-| 数据来源 | 许可状态 | 可否蒸馏 |
-|---------|---------|---------|
-| OpenAI (GPT-4/o1) | ToS 禁止训练竞争模型 | **不可以** |
-| Anthropic (Claude) | 使用政策限制 | **不可以** |
-| Google (Gemini) | 类似限制 | **不可以** |
-| **DeepSeek-R1** | **MIT 许可** | **可以** |
-| **Llama 3.1 (Meta)** | 社区许可证，鼓励蒸馏 | **可以** |
-| **Qwen 系列** | **Apache 2.0** | **可以** |
-| StarCoder2 | OpenRAIL-M | **可以** |
+| 数据来源 | 许可状态 | 可否蒸馏 | 备注 |
+|---------|---------|---------|------|
+| OpenAI (GPT-4/o1) | ToS 禁止训练竞争模型 | **不可以** | -- |
+| Anthropic (Claude) | 使用政策限制 | **不可以** | -- |
+| Google (Gemini) | 类似限制 | **不可以** | -- |
+| **DeepSeek-R1** | **MIT 许可** | **可以** | 671B MoE，蒸馏标杆 |
+| **Llama 3.1 (Meta)** | 社区许可证，鼓励蒸馏 | **可以** | -- |
+| **Qwen2.5-Coder** | **Apache 2.0** | **可以** | 7B/14B，经济 base |
+| **Qwen3-Coder** | **Apache 2.0** | **可以** | 480B/36B MoE，SWE-bench 70% |
+| **GLM-5 / GLM-5.1** | **MIT** | **可以** | 744B/40B MoE，SWE-bench 77.8% |
+| **MiniMax M2.5** | **Modified-MIT** | **可以** | ~228B MoE，SWE-bench 80.2% SOTA |
+| **Kimi K2.5** | **Modified-MIT** | **可以** | 1T/32B MoE，多模态 Agent |
+| StarCoder2 | OpenRAIL-M | **可以** | 3B/7B/15B |
 
-> 2025 年起 AI 公司开始部署水印和指纹技术检测蒸馏行为。
+> 2025 年起 AI 公司开始部署水印和指纹技术检测蒸馏行为。2026 年国产开源模型爆发，MIT/Apache 2.0 许可的 SWE-bench 70%+ 模型已可自由蒸馏。
 
 ### 6.3 蒸馏 vs API 调用：何时值得？
 
@@ -206,6 +212,8 @@
 
 ## 七、2025-2026 年重要进展
 
+### 7.1 2025 年：蒸馏路线确立
+
 1. **DeepSeek-R1 蒸馏的里程碑意义**：首次大规模证明蒸馏在小模型上优于 RL。800K 样本 SFT "菜谱"已被广泛复制。
 
 2. **RLCEF 的兴起**：代码执行反馈作为 RL 奖励信号，比 RLHF 更客观。趋势是蒸馏 SFT 作 warm-up，再用 RLCEF 优化。
@@ -214,13 +222,35 @@
 
 4. **开源生态爆发**：HuggingFace agent 轨迹数据集快速增长；SmolAgents、OpenHands 支持小模型 agent；TRL、LLaMA-Factory、Axolotl 支持 LoRA + 蒸馏。
 
+### 7.2 2026 年：Agent-native RL 与开源 teacher 池爆发
+
+1. **RL scaling 成为核心引擎**：
+   - **GLM-5 slime 异步 RL**：大幅提升 RL 训练效率，支持 744B MoE 规模
+   - **MiniMax Forge Agent-native RL + CISPO 算法**：200K+ 真实环境 RL 训练，spec-writing 行为自发涌现
+   - **Kimi K2.5 Agent Swarm RL**：多 agent 协同环境中训练，多模态 Agent 能力突破
+   - 共同特征：不是在单步代码生成上做 RL，而是在**长时段 Agent 任务**中做 RL
+
+2. **MoE 架构统一化**：GLM-5（744B/40B）、Kimi K2.5（1T/32B）、MiniMax M2.5（~228B）、Qwen3-Coder（480B/36B）、DeepSeek V3.2 — 无一例外。MoE 让大规模 teacher 模型推理成本可控，蒸馏实验可行性大增。
+
+3. **Benchmark 从单步生成转向 Agent 工程**：
+   - SWE-bench Verified → **SWE-Bench Pro**（多文件、跨模块、长时段任务）
+   - 新增 Terminal-Bench 2.0、CyberGym、NL2Repo、BrowseComp
+   - 测的不是"写一个函数"，而是"在数百轮工具调用中持续改进、定位阻塞、修正策略"
+
+4. **开源 teacher 池质量跃升**：
+   - MIT/Apache 2.0 许可的模型已覆盖 SWE-bench 70-80% 区间
+   - GLM-5（MIT，77.8%）、MiniMax M2.5（Modified-MIT，80.2%）、Qwen3-Coder（Apache 2.0，70%）
+   - 不再需要依赖闭源模型输出做蒸馏，合规风险大幅降低
+
+5. **成本断崖式下降**：MiniMax M2.5 持续运行 1 小时仅 $1（100 TPS），是 Claude Opus 的 1/10~1/20。"Intelligence too cheap to meter"正在成为现实，蒸馏的经济动机从"省钱"转向"定制化 + 离线部署"。
+
 ---
 
 ## 八、推荐蒸馏实操路线
 
 ### 第一层：快速验证（1-2 天，< $10）
 
-1. Base: Qwen2.5-Coder-7B-Instruct
+1. Base: Qwen2.5-Coder-7B-Instruct（经济选择）或 Qwen3-Coder 的小规模变体
 2. 收集 50-100 条编码 agent 轨迹（OpenHands 开源数据或自行用开源强模型生成）
 3. QLoRA (4-bit) 单张 A100 微调
 4. 评估：对比微调前后简单工具调用任务表现
@@ -228,7 +258,7 @@
 ### 第二层：Agent 行为蒸馏（3-5 天，$50-200）
 
 1. Base: Qwen2.5-Coder-14B 或 32B
-2. 从 DeepSeek-R1 或 Qwen-72B 生成 1K-5K 条 team mode 轨迹
+2. Teacher: GLM-5（MIT，SWE-bench 77.8%）或 Qwen3-Coder（Apache 2.0，70%）生成 1K-5K 条 team mode 轨迹
 3. 格式：过滤后完整轨迹，含 Agent spawn 时机、SendMessage、多阶段编排
 4. 全参数或 LoRA rank=64+
 5. 评估：自定义 team mode benchmark
@@ -262,12 +292,13 @@
 
 1. **蒸馏可行**，且是小团队构建编码 agent 最现实的路径
 2. **必须做轨迹蒸馏**，不是问答蒸馏 — 代码补全能力可预训练获得，agent 行为必须通过轨迹学习
-3. **推荐路线**：Qwen2.5-Coder 7B/14B + 开源轨迹 + QLoRA，成本 < $10
-4. **合规红线**：不能用 Claude/GPT 输出做商用蒸馏。DeepSeek-R1 (MIT) 和 Qwen (Apache 2.0) 安全
+3. **推荐路线**：Qwen2.5-Coder 7B/14B 做 base + GLM-5/Qwen3-Coder 做 teacher + QLoRA，成本 < $10
+4. **合规红线**：不能用 Claude/GPT 输出做商用蒸馏。2026 年 MIT/Apache 2.0 许可的 SWE-bench 70-80% 模型已充足
 5. **蒸馏不是终点**：最强方案是"蒸馏 SFT + RL"混合流水线，但纯蒸馏 SFT 足以展示核心概念
+6. **2026 新变量**：开源 teacher 池质量跃升（GLM-5 MIT 77.8%、MiniMax M2.5 80.2%），蒸馏天花板显著提高；Agent-native RL 是各家突破 SWE-bench 75%+ 的共同路线，蒸馏 + RL 组合潜力更大
 
-**一句话：** 80 万条样本 SFT 就能让 32B 模型超越 o1-mini（DeepSeek-R1 已证明），但要做编码智能体而不是补全器，必须做轨迹级蒸馏。
+**一句话：** 2025 年 DeepSeek-R1 证明了 800K 样本 SFT 可让 32B 超越 o1-mini；2026 年 GLM-5/MiniMax 证明了 MIT 开源模型已达 SWE-bench 80%——蒸馏的 teacher 质量不再是瓶颈，轨迹格式和 RL 后训练才是。
 
 ---
 
-*核心参考：DeepSeek-R1 技术报告 (arXiv:2501.12948), FireAct (Chen et al., 2023), Agent LUMOS (ACL 2024), Qwen2.5-Coder 技术报告*
+*核心参考：DeepSeek-R1 技术报告 (arXiv:2501.12948), FireAct (Chen et al., 2023), Agent LUMOS (ACL 2024), Qwen2.5-Coder 技术报告, GLM-5 技术报告 (arXiv:2602.15763), Kimi K2.5 技术报告 (arXiv:2602.02276)*
