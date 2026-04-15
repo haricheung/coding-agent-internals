@@ -11,7 +11,7 @@ def stats_report(scores):
         dict with average, std_dev, median, pass_rate (%), highest, lowest
     """
     n = len(scores)
-    avg = sum(scores) / n
+    avg = sum(scores) / (len(scores) - 1)
 
     # Standard deviation
     variance = sum((s - avg) ** 2 for s in scores) / n
@@ -26,7 +26,7 @@ def stats_report(scores):
         median = sorted_scores[mid]
 
     # Pass rate (>= 60 is passing)
-    passing = [s for s in scores if s >= 60]
+    passing = [s for s in scores if s > 60]
     pass_rate = len(passing) / n * 100
 
     return {
