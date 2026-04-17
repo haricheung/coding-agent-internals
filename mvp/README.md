@@ -99,6 +99,21 @@ python model_server.py /path/to/30B --port 9982 --vllm-port 8001
 
 Demo UI 中点 "Edit" 可添加多个 model server 地址，方便演示切换。
 
+## Demo 脚本
+
+课程 6 个 Demo 的操作脚本和讲解在 `demo/` 目录下：
+
+| Demo | 脚本 | 对应课程 |
+|------|------|---------|
+| Demo 1 | [demo1_chat_vs_agent.md](demo/demo1_chat_vs_agent.md) | 讲 1：Chat vs Agent |
+| Demo 2 | [demo2_protocol_teardown.md](demo/demo2_protocol_teardown.md) | 讲 2：工具调用协议 |
+| Demo 3 | [demo3_bug_fix_flow.md](demo/demo3_bug_fix_flow.md) | 讲 3：修 Bug 实战 |
+| Demo 4 | [demo4_aci_granularity.md](demo/demo4_aci_granularity.md) | 讲 4：ACI 设计 |
+| Demo 5 | [demo5_agentless_vs_agent.md](demo/demo5_agentless_vs_agent.md) | 讲 5：流水线 vs Agent |
+| Demo 6 | [demo6_agent_team.md](demo/demo6_agent_team.md) | 讲 6：Agent Team |
+
+每个 Demo 都有配套的 `recording_*.md` 讲解文档，记录预期的演示流程和关键观察点。
+
 ## 文件结构
 
 ```
@@ -108,8 +123,10 @@ mvp/src/
 ├── parser.py         # 鲁棒工具调用解析（fallback for vLLM）
 ├── client.py         # CLI Agent 客户端（ReAct 循环）
 ├── main.py           # CLI 入口
+├── tools.py          # 核心工具集（Read/Write/Edit/Grep/Bash 等）
 ├── agent_tool.py     # Agent/SendMessage 子 Agent 工具
-├── team_tools.py     # TeamCreate/TaskCreate/TaskUpdate 等团队工具
+├── team_tools.py     # TeamCreate/TeamUpdate 等团队协调工具
+├── task_tools.py     # TaskCreate/TaskUpdate/TaskList 任务管理工具
 ├── trajectory.py     # Agent 轨迹记录
 ├── demo.html         # Chat vs Agent 演示页面
 └── dashboard.html    # 测试结果仪表盘
